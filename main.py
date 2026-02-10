@@ -1369,7 +1369,7 @@ async def apify_main():
             await Actor.fail("No URL provided. Please provide a video URL.")
             return
         
-        await Actor.log.info(f"Processing URL: {url}")
+        Actor.log.info(f"Processing URL: {url}")
         
         try:
             # Determine platform
@@ -1382,7 +1382,7 @@ async def apify_main():
             elif "instagram" in url_lower:
                 platform = "instagram"
             
-            await Actor.log.info(f"Detected platform: {platform}")
+            Actor.log.info(f"Detected platform: {platform}")
             
             # Build proxy configuration for yt-dlp
             proxy_url = None
@@ -1394,7 +1394,7 @@ async def apify_main():
                 )
                 if proxy_configuration:
                     proxy_url = proxy_configuration.url
-                    await Actor.log.info("Using Apify residential proxy")
+                    Actor.log.info("Using Apify residential proxy")
             
             # Extract video metadata
             if platform == "youtube":
@@ -1408,7 +1408,7 @@ async def apify_main():
                 )
                 result = metadata.dict()
                 if extract_comments:
-                    await Actor.log.info("Extracting comments...")
+                    Actor.log.info("Extracting comments...")
                     comments_resp = await asyncio.to_thread(
                         extract_youtube_comments, 
                         url, 
@@ -1429,7 +1429,7 @@ async def apify_main():
                 )
                 result = metadata.dict()
                 if extract_comments:
-                    await Actor.log.info("Extracting comments...")
+                    Actor.log.info("Extracting comments...")
                     comments_resp = await asyncio.to_thread(
                         extract_tiktok_comments, 
                         url, 
@@ -1450,7 +1450,7 @@ async def apify_main():
                 )
                 result = metadata.dict()
                 if extract_comments:
-                    await Actor.log.info("Extracting comments...")
+                    Actor.log.info("Extracting comments...")
                     comments_resp = await asyncio.to_thread(
                         extract_twitter_comments, 
                         url, 
@@ -1471,7 +1471,7 @@ async def apify_main():
                 )
                 result = metadata.dict()
                 if extract_comments:
-                    await Actor.log.info("Extracting comments...")
+                    Actor.log.info("Extracting comments...")
                     comments_resp = await asyncio.to_thread(
                         extract_instagram_comments, 
                         url, 
@@ -1485,7 +1485,7 @@ async def apify_main():
             
             # Download video if requested
             if download_video:
-                await Actor.log.info("Downloading video...")
+                Actor.log.info("Downloading video...")
                 try:
                     video_key = f"video_{platform}_{result.get('video_id', 'unknown')}.mp4"
                     video_url = await download_video_to_store(
@@ -1497,12 +1497,12 @@ async def apify_main():
                     if video_url:
                         result["video_download_url"] = video_url
                         result["video_stored"] = True
-                        await Actor.log.info(f"Video saved: {video_key}")
+                        Actor.log.info(f"Video saved: {video_key}")
                     else:
                         result["video_stored"] = False
                         result["video_error"] = "Could not download video"
                 except Exception as e:
-                    await Actor.log.error(f"Video download failed: {e}")
+                    Actor.log.error(f"Video download failed: {e}")
                     result["video_stored"] = False
                     result["video_error"] = str(e)
             
@@ -1510,13 +1510,13 @@ async def apify_main():
             result["platform"] = platform
             result["extracted_at"] = datetime.utcnow().isoformat()
             
-            await Actor.log.info(f"Successfully extracted data from {platform}")
+            Actor.log.info(f"Successfully extracted data from {platform}")
             
             # Push to dataset
             await Actor.push_data(result)
             
         except Exception as e:
-            await Actor.log.error(f"Extraction failed: {str(e)}")
+            Actor.log.error(f"Extraction failed: {str(e)}")
             await Actor.fail(str(e))
 
 
