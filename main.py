@@ -1558,14 +1558,22 @@ async def download_video_to_store(url: str, platform: str, proxy_url: Optional[s
             # Upload to Apify's key-value store
             key = f"videos/{platform}_{video_id}.{ext}"
             
+            # Read file and upload
             with open(temp_path, 'rb') as f:
-                await Actor.set_value(key, f.read(), content_type=f'video/{ext}')
+                file_data = f.read()
+            
+            # Use the default key-value store
+            kv_store = await Actor.open_key_value_store()
+            await kv_store.set_value(key, file_data, content_type=f'video/{ext}')
             
             # Clean up temp file
             os.remove(temp_path)
             
-            # Return the public URL (this will be accessible from Apify console)
-            return f"https://api.apify.com/v2/key-value-stores/{Actor.config.default_key_value_store_id}/records/{key}"
+            # Return the public URL
+            public_url = kv_store.get_public_url(key)
+            Actor.log.info(f"Video stored at: {public_url}")
+            
+            return public_url
         
     return None
 
