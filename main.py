@@ -1581,7 +1581,7 @@ async def download_video_to_store(url: str, platform: str, proxy_url: Optional[s
             
             # Build the public URL manually
             # Format: https://api.apify.com/v2/key-value-stores/{storeId}/records/{key}
-            store_id = Actor.config.default_key_value_store_id
+            store_id = os.environ.get('APIFY_DEFAULT_KEY_VALUE_STORE_ID', '')
             public_url = f"https://api.apify.com/v2/key-value-stores/{store_id}/records/{key}"
             
             Actor.log.info(f"Video stored successfully: {public_url}")
