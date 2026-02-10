@@ -952,18 +952,20 @@ def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: in
         'no_warnings': True,
         'extract_flat': False,
         'getcomments': True,
-        'max_comments': [max_comments, max_comments, max_comments, max_comments],  # [top, newest, replies, all]
+        'max_comments': [max_comments, max_comments, 0, 0],  # [total, parents, replies_per_thread, total_replies]
+        'extractor_args': {'youtube': {'comment_sort': ['top']}},
+        'socket_timeout': 30,
     }
-    
+
     # Add proxy if provided or requested
     if proxy_url:
         ydl_opts['proxy'] = proxy_url
-        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+        ydl_opts['extractor_args']['youtube']['player_client'] = ['android', 'web']
     elif use_proxy:
         proxy = get_proxy(use_scrapeops=True)
         if proxy:
             ydl_opts['proxy'] = proxy
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+            ydl_opts['extractor_args']['youtube']['player_client'] = ['android', 'web']
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
