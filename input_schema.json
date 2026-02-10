@@ -1,0 +1,39 @@
+{
+  "title": "Video Metadata Extractor",
+  "description": "Extract metadata, comments, and direct video URLs from social media platforms",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "url": {
+      "title": "Video URL",
+      "type": "string",
+      "description": "YouTube, TikTok, Twitter/X, or Instagram video URL",
+      "editor": "textfield",
+      "nullable": false
+    },
+    "extractComments": {
+      "title": "Extract Comments",
+      "type": "boolean",
+      "description": "Also extract video comments (may take longer)",
+      "default": false,
+      "editor": "checkbox"
+    },
+    "useProxy": {
+      "title": "Use Proxy",
+      "type": "boolean",
+      "description": "Use residential proxy for better reliability (recommended for YouTube)",
+      "default": true,
+      "editor": "checkbox"
+    },
+    "maxComments": {
+      "title": "Max Comments",
+      "type": "integer",
+      "description": "Maximum number of comments to extract (if extractComments is enabled)",
+      "default": 50,
+      "minimum": 1,
+      "maximum": 500,
+      "editor": "number"
+    }
+  },
+  "required": ["url"]
+}

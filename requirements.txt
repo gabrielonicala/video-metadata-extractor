@@ -1,0 +1,7 @@
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.5.0
+yt-dlp>=2026.2.4
+python-multipart>=0.0.6
+apify>=1.0.0
+TikTokApi>=6.0.0

@@ -1,0 +1,15 @@
+{
+  "actorSpecification": 1,
+  "name": "video-metadata-extractor",
+  "title": "Video Metadata Extractor",
+  "description": "Extract metadata, comments, and direct URLs from YouTube, TikTok, Twitter/X, and Instagram videos",
+  "version": "1.0.0",
+  "meta": {
+    "templateId": "python-playwright"
+  },
+  "input": "./input_schema.json",
+  "dockerfile": "./Dockerfile",
+  "storages": {
+    "dataset": "./dataset_schema.json"
+  }
+}
