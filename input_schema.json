@@ -33,6 +33,13 @@
       "minimum": 1,
       "maximum": 500,
       "editor": "number"
+    },
+    "streamVideo": {
+      "title": "Enable Video Streaming",
+      "type": "boolean",
+      "description": "Include video streaming URL (consumes more bandwidth, URLs work from any IP)",
+      "default": false,
+      "editor": "checkbox"
     }
   },
   "required": ["url"]

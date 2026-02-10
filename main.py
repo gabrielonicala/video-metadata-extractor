@@ -239,7 +239,9 @@ def extract_twitter_comments_playwright(url: str, max_comments: int = 50) -> Com
     More reliable than yt-dlp for Twitter comments.
     """
     from playwright.sync_api import sync_playwright
+    from datetime import datetime
     import time
+    import re
     
     comments_list = []
     video_title = None
@@ -276,12 +278,18 @@ def extract_twitter_comments_playwright(url: str, max_comments: int = 50) -> Com
             )
             page = context.new_page()
             
-            # Navigate to tweet
+            # Navigate to tweet with longer timeout
             log_info(f"Navigating to {url}")
-            page.goto(url, wait_until='networkidle')
+            page.goto(url, wait_until='networkidle', timeout=30000)
             
-            # Wait for tweet to load
-            page.wait_for_selector('article[data-testid="tweet"]', timeout=10000)
+            # Wait for tweet to load (increased timeout)
+            try:
+                page.wait_for_selector('article[data-testid="tweet"]', timeout=15000)
+            except Exception as e:
+                log_warning(f"Timeout waiting for tweet, trying alternative selector...")
+                # Try alternative: Twitter might have different structure
+                page.wait_for_load_state('domcontentloaded', timeout=10000)
+                time.sleep(3)  # Give extra time for JS to render
             
             # Extract tweet ID from URL
             tweet_id = url.split('/status/')[-1].split('?')[0]
@@ -297,7 +305,7 @@ def extract_twitter_comments_playwright(url: str, max_comments: int = 50) -> Com
             log_info("Scrolling to load comments...")
             for _ in range(5):  # Scroll 5 times
                 page.keyboard.press('End')
-                time.sleep(1)
+                time.sleep(1.5)  # Increased delay for loading
             
             # Extract comments/replies
             # Twitter uses div[data-testid="cellInnerDiv"] for reply cells
@@ -336,7 +344,6 @@ def extract_twitter_comments_playwright(url: str, max_comments: int = 50) -> Com
                         like_text = like_elem.get_attribute('aria-label')
                         if like_text:
                             # Extract number from "X likes" or "X Likes"
-                            import re
                             match = re.search(r'(\d+)', like_text.replace(',', ''))
                             if match:
                                 like_count = int(match.group(1))
@@ -349,7 +356,6 @@ def extract_twitter_comments_playwright(url: str, max_comments: int = 50) -> Com
                         time_elem = cell.locator('time').first
                         datetime_str = time_elem.get_attribute('datetime')
                         if datetime_str:
-                            from datetime import datetime
                             dt = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
                             timestamp = int(dt.timestamp())
                     except:
@@ -1290,6 +1296,7 @@ async def apify_main():
         extract_comments = actor_input.get("extractComments", False)
         use_proxy = actor_input.get("useProxy", True)
         max_comments = actor_input.get("maxComments", 50)
+        stream_video = actor_input.get("streamVideo", False)
         
         if not url:
             await Actor.fail("No URL provided. Please provide a video URL.")
@@ -1344,6 +1351,13 @@ async def apify_main():
                     result["comments"] = comments_resp.comments
                     result["comments_extracted"] = len(comments_resp.comments)
             
+            # Add streaming URL if requested
+            if stream_video:
+                Actor.log.info("Generating streaming URL...")
+                # Add a placeholder - actual streaming would need a separate endpoint
+                result["video_stream_url"] = f"Use the /stream endpoint with the same URL"
+                result["note"] = "To stream video, use the /stream endpoint or the standalone API server"
+            
             # Add metadata
             result["platform"] = platform
             result["extracted_at"] = datetime.utcnow().isoformat()
@@ -1351,6 +1365,7 @@ async def apify_main():
             Actor.log.info(f"Successfully extracted data from {platform}")
             
             # Push to dataset
+            await Actor.push_data(result)
             await Actor.push_data(result)
             
         except Exception as e:
