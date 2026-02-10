@@ -1366,7 +1366,8 @@ async def apify_main():
         download_video = actor_input.get("downloadVideo", False)
         
         if not url:
-            await Actor.fail("No URL provided. Please provide a video URL.")
+            Actor.log.error("No URL provided. Please provide a video URL.")
+            return
             return
         
         Actor.log.info(f"Processing URL: {url}")
@@ -1393,7 +1394,8 @@ async def apify_main():
                     country_code='US'  # Optional: specify country
                 )
                 if proxy_configuration:
-                    proxy_url = proxy_configuration.url
+                    # Get a new proxy URL from the configuration
+                    proxy_url = await proxy_configuration.new_url()
                     Actor.log.info("Using Apify residential proxy")
             
             # Extract video metadata
@@ -1517,7 +1519,8 @@ async def apify_main():
             
         except Exception as e:
             Actor.log.error(f"Extraction failed: {str(e)}")
-            await Actor.fail(str(e))
+            Actor.log.error(f"Extraction failed: {str(e)}")
+            raise  # Re-raise the exception to fail the actor
 
 
 async def download_video_to_store(url: str, platform: str, proxy_url: Optional[str], Actor) -> Optional[str]:
