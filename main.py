@@ -232,45 +232,201 @@ def extract_twitter_metadata(url: str, use_proxy: bool = False, include_all_form
         )
 
 
-def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: int = 50) -> CommentsResponse:
-    """Extract comments from a Twitter/X post"""
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': False,
-        'getcomments': True,
-        'max_comments': [max_comments, max_comments, max_comments, max_comments],
-    }
+def extract_twitter_comments_playwright(url: str, max_comments: int = 50) -> CommentsResponse:
+    """Extract comments from Twitter/X using Playwright browser automation
     
-    # Add proxy if requested
-    if use_proxy:
-        proxy_url = get_proxy(use_scrapeops=True)
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+    This uses headless browser to navigate to the tweet and extract replies.
+    More reliable than yt-dlp for Twitter comments.
+    """
+    from playwright.sync_api import sync_playwright
+    import time
     
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        
-        comments_list = []
-        raw_comments = info.get('comments', []) or []
-        
-        for comment_data in raw_comments[:max_comments]:
-            comment = Comment(
-                author=comment_data.get('author'),
-                author_id=comment_data.get('author_id'),
-                text=comment_data.get('text'),
-                like_count=comment_data.get('like_count'),
-                timestamp=comment_data.get('timestamp'),
-                reply_count=len(comment_data.get('replies', [])) if comment_data.get('replies') else 0
+    comments_list = []
+    video_title = None
+    tweet_id = None
+    
+    # Helper function for logging that works both in and out of Apify context
+    def log_info(msg):
+        try:
+            from apify import Actor
+            Actor.log.info(msg)
+        except:
+            print(f"INFO: {msg}")
+    
+    def log_warning(msg):
+        try:
+            from apify import Actor
+            Actor.log.warning(msg)
+        except:
+            print(f"WARNING: {msg}")
+    
+    def log_error(msg):
+        try:
+            from apify import Actor
+            Actor.log.error(msg)
+        except:
+            print(f"ERROR: {msg}")
+    
+    try:
+        with sync_playwright() as p:
+            # Launch browser
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             )
-            comments_list.append(comment)
+            page = context.new_page()
+            
+            # Navigate to tweet
+            log_info(f"Navigating to {url}")
+            page.goto(url, wait_until='networkidle')
+            
+            # Wait for tweet to load
+            page.wait_for_selector('article[data-testid="tweet"]', timeout=10000)
+            
+            # Extract tweet ID from URL
+            tweet_id = url.split('/status/')[-1].split('?')[0]
+            
+            # Try to get tweet text as title
+            try:
+                tweet_text = page.locator('article[data-testid="tweet"] div[data-testid="tweetText"]').first.text_content()
+                video_title = tweet_text[:100] if tweet_text else None
+            except:
+                pass
+            
+            # Scroll down to load comments
+            log_info("Scrolling to load comments...")
+            for _ in range(5):  # Scroll 5 times
+                page.keyboard.press('End')
+                time.sleep(1)
+            
+            # Extract comments/replies
+            # Twitter uses div[data-testid="cellInnerDiv"] for reply cells
+            reply_cells = page.locator('div[data-testid="cellInnerDiv"]').all()
+            
+            log_info(f"Found {len(reply_cells)} potential reply cells")
+            
+            for cell in reply_cells[:max_comments]:
+                try:
+                    # Skip if it's the main tweet (not a reply)
+                    if cell.locator('article[data-testid="tweet"]').count() == 0:
+                        continue
+                    
+                    # Extract author
+                    author_elem = cell.locator('a[role="link"] span').first
+                    author = author_elem.text_content() if author_elem.count() > 0 else None
+                    
+                    # Extract author ID from href
+                    author_id = None
+                    try:
+                        author_link = cell.locator('a[href^="/"]').first
+                        href = author_link.get_attribute('href')
+                        if href:
+                            author_id = href.strip('/').split('/')[0]
+                    except:
+                        pass
+                    
+                    # Extract comment text
+                    text_elem = cell.locator('div[data-testid="tweetText"]').first
+                    text = text_elem.text_content() if text_elem.count() > 0 else ""
+                    
+                    # Extract like count
+                    like_count = 0
+                    try:
+                        like_elem = cell.locator('button[data-testid="like"]').first
+                        like_text = like_elem.get_attribute('aria-label')
+                        if like_text:
+                            # Extract number from "X likes" or "X Likes"
+                            import re
+                            match = re.search(r'(\d+)', like_text.replace(',', ''))
+                            if match:
+                                like_count = int(match.group(1))
+                    except:
+                        pass
+                    
+                    # Extract timestamp
+                    timestamp = None
+                    try:
+                        time_elem = cell.locator('time').first
+                        datetime_str = time_elem.get_attribute('datetime')
+                        if datetime_str:
+                            from datetime import datetime
+                            dt = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
+                            timestamp = int(dt.timestamp())
+                    except:
+                        pass
+                    
+                    # Only add if we have text or author
+                    if text or author:
+                        comment = Comment(
+                            author=author,
+                            author_id=author_id,
+                            text=text,
+                            like_count=like_count,
+                            timestamp=timestamp,
+                            reply_count=0  # Twitter doesn't easily expose this
+                        )
+                        comments_list.append(comment)
+                        
+                        if len(comments_list) >= max_comments:
+                            break
+                            
+                except Exception as e:
+                    log_warning(f"Error extracting comment: {e}")
+                    continue
+            
+            browser.close()
         
         return CommentsResponse(
             success=True,
-            video_id=info.get('id'),
-            video_title=info.get('title') or (info.get('description', '').split('\n')[0][:100] if info.get('description') else None),
-            total_comments=info.get('comment_count'),
+            video_id=tweet_id,
+            video_title=video_title,
+            total_comments=len(comments_list),
             comments=comments_list,
+            timestamp=datetime.utcnow().isoformat()
+        )
+        
+    except Exception as e:
+        log_error(f"Playwright extraction failed: {e}")
+        # Fall back to empty response
+        return CommentsResponse(
+            success=False,
+            video_id=tweet_id,
+            video_title=video_title,
+            total_comments=0,
+            comments=[],
+            error=str(e),
+            timestamp=datetime.utcnow().isoformat()
+        )
+
+
+def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: int = 50) -> CommentsResponse:
+    """Extract comments from a Twitter/X post using Playwright browser automation"""
+    
+    # Helper function for logging
+    def log_info(msg):
+        try:
+            from apify import Actor
+            Actor.log.info(msg)
+        except:
+            print(f"INFO: {msg}")
+    
+    def log_error(msg):
+        try:
+            from apify import Actor
+            Actor.log.error(msg)
+        except:
+            print(f"ERROR: {msg}")
+    
+    try:
+        # Try Playwright method first
+        log_info("Attempting Twitter comments extraction via Playwright...")
+        return extract_twitter_comments_playwright(url, max_comments)
+    except Exception as e:
+        log_error(f"Playwright method failed: {e}")
+        # Return empty response with error
+        return CommentsResponse(
+            success=False,
+            error=f"Could not extract Twitter comments: {str(e)}",
             timestamp=datetime.utcnow().isoformat()
         )
 

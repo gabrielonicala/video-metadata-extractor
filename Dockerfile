@@ -5,6 +5,8 @@ COPY requirements.txt ./
 
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Playwright browsers (Chromium is already installed in base image)
 RUN playwright install chromium
 
 # Copy source code
