@@ -1567,7 +1567,7 @@ async def download_video_to_store(url: str, platform: str, proxy_url: Optional[s
             Actor.log.info(f"Downloaded {file_size} bytes, uploading to storage...")
             
             # Upload to Apify's key-value store
-            key = f"videos/{platform}_{video_id}.{ext}"
+            key = f"{platform}_{video_id}.{ext}"
             
             # Read file
             with open(temp_path, 'rb') as f:
