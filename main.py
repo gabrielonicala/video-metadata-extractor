@@ -1139,7 +1139,7 @@ async def apify_main():
             await Actor.fail("No URL provided. Please provide a video URL.")
             return
         
-        await Actor.log.info(f"Processing URL: {url}")
+        Actor.log.info(f"Processing URL: {url}")
         
         try:
             # Determine platform
@@ -1152,49 +1152,53 @@ async def apify_main():
             elif "instagram" in url_lower:
                 platform = "instagram"
             
-            await Actor.log.info(f"Detected platform: {platform}")
+            Actor.log.info(f"Detected platform: {platform}")
             
             # Extract video metadata
             if platform == "youtube":
-                result = await extract_youtube_video(url, use_proxy)
+                metadata = await asyncio.to_thread(extract_youtube_metadata, url, None, use_proxy, True)
+                result = metadata.dict()
                 if extract_comments:
-                    await Actor.log.info("Extracting comments...")
-                    comments = await extract_youtube_comments(url, use_proxy, max_comments)
-                    result["comments"] = comments
-                    result["comments_extracted"] = len(comments)
+                    Actor.log.info("Extracting comments...")
+                    comments_resp = await asyncio.to_thread(extract_youtube_comments, url, use_proxy, max_comments)
+                    result["comments"] = comments_resp.comments
+                    result["comments_extracted"] = len(comments_resp.comments)
             elif platform == "tiktok":
-                result = await extract_tiktok_video(url)
+                metadata = await asyncio.to_thread(extract_tiktok_metadata, url, False, True)
+                result = metadata.dict()
                 if extract_comments:
-                    await Actor.log.info("Extracting comments...")
-                    comments = await extract_tiktok_comments(url, max_comments)
-                    result["comments"] = comments
-                    result["comments_extracted"] = len(comments)
+                    Actor.log.info("Extracting comments...")
+                    comments_resp = await asyncio.to_thread(extract_tiktok_comments, url, False, max_comments)
+                    result["comments"] = comments_resp.comments
+                    result["comments_extracted"] = len(comments_resp.comments)
             elif platform == "twitter":
-                result = await extract_twitter_video(url)
+                metadata = await asyncio.to_thread(extract_twitter_metadata, url, use_proxy, True)
+                result = metadata.dict()
                 if extract_comments:
-                    await Actor.log.info("Extracting comments...")
-                    comments = await extract_twitter_comments(url, max_comments)
-                    result["comments"] = comments
-                    result["comments_extracted"] = len(comments)
+                    Actor.log.info("Extracting comments...")
+                    comments_resp = await asyncio.to_thread(extract_twitter_comments, url, use_proxy, max_comments)
+                    result["comments"] = comments_resp.comments
+                    result["comments_extracted"] = len(comments_resp.comments)
             else:  # instagram
-                result = await extract_instagram_video(url)
+                metadata = await asyncio.to_thread(extract_instagram_metadata, url, "instagram_cookies.txt", use_proxy, True)
+                result = metadata.dict()
                 if extract_comments:
-                    await Actor.log.info("Extracting comments...")
-                    comments = await extract_instagram_comments(url, max_comments)
-                    result["comments"] = comments
-                    result["comments_extracted"] = len(comments)
+                    Actor.log.info("Extracting comments...")
+                    comments_resp = await asyncio.to_thread(extract_instagram_comments, url, "instagram_cookies.txt", use_proxy, max_comments)
+                    result["comments"] = comments_resp.comments
+                    result["comments_extracted"] = len(comments_resp.comments)
             
             # Add metadata
             result["platform"] = platform
             result["extracted_at"] = datetime.utcnow().isoformat()
             
-            await Actor.log.info(f"Successfully extracted data from {platform}")
+            Actor.log.info(f"Successfully extracted data from {platform}")
             
             # Push to dataset
             await Actor.push_data(result)
             
         except Exception as e:
-            await Actor.log.error(f"Extraction failed: {str(e)}")
+            Actor.log.error(f"Extraction failed: {str(e)}")
             await Actor.fail(str(e))
 
 
