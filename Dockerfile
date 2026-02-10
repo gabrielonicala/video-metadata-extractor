@@ -11,4 +11,4 @@ RUN playwright install chromium
 COPY . ./
 
 # Run the actor
-CMD ["python", "-m", "apify"]
+CMD ["python", "main.py"]
