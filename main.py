@@ -1489,8 +1489,7 @@ async def apify_main():
             if download_video:
                 Actor.log.info("Downloading video...")
                 try:
-                    video_key = f"video_{platform}_{result.get('video_id', 'unknown')}.mp4"
-                    video_url = await download_video_to_store(
+                    video_url, video_error = await download_video_to_store(
                         url, 
                         platform, 
                         proxy_url,
@@ -1499,10 +1498,10 @@ async def apify_main():
                     if video_url:
                         result["video_download_url"] = video_url
                         result["video_stored"] = True
-                        Actor.log.info(f"Video saved: {video_key}")
+                        result["video_error"] = None
                     else:
                         result["video_stored"] = False
-                        result["video_error"] = "Could not download video"
+                        result["video_error"] = video_error or "Unknown error during download"
                 except Exception as e:
                     Actor.log.error(f"Video download failed: {e}")
                     result["video_stored"] = False
@@ -1523,59 +1522,78 @@ async def apify_main():
             raise  # Re-raise the exception to fail the actor
 
 
-async def download_video_to_store(url: str, platform: str, proxy_url: Optional[str], Actor) -> Optional[str]:
+async def download_video_to_store(url: str, platform: str, proxy_url: Optional[str], Actor) -> tuple[Optional[str], Optional[str]]:
     """Download video to Apify's key-value store
     
-    Returns the public URL to access the video.
+    Returns:
+        (public_url, error_message) - public_url is None if failed, error_message explains why
     """
     import tempfile
     import os
     
-    ydl_opts = {
-        'quiet': True,
-        'format': 'best',
-        'outtmpl': tempfile.gettempdir() + '/%(id)s.%(ext)s',
-    }
-    
-    if proxy_url:
-        ydl_opts['proxy'] = proxy_url
-    
-    if platform == 'youtube':
-        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
-    
-    if platform == 'instagram' and os.path.exists('instagram_cookies.txt'):
-        ydl_opts['cookiefile'] = 'instagram_cookies.txt'
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        video_id = info.get('id', 'video')
-        ext = info.get('ext', 'mp4')
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'format': 'best',
+            'outtmpl': tempfile.gettempdir() + '/%(id)s.%(ext)s',
+        }
         
-        # Find the downloaded file
-        temp_path = os.path.join(tempfile.gettempdir(), f"{video_id}.{ext}")
+        if proxy_url:
+            ydl_opts['proxy'] = proxy_url
         
-        if os.path.exists(temp_path):
+        if platform == 'youtube':
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+        
+        if platform == 'instagram' and os.path.exists('instagram_cookies.txt'):
+            ydl_opts['cookiefile'] = 'instagram_cookies.txt'
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            video_id = info.get('id', 'video')
+            ext = info.get('ext', 'mp4')
+            
+            # Find the downloaded file
+            temp_path = os.path.join(tempfile.gettempdir(), f"{video_id}.{ext}")
+            
+            if not os.path.exists(temp_path):
+                return None, f"Download failed: file not found at {temp_path}"
+            
+            # Check file size
+            file_size = os.path.getsize(temp_path)
+            if file_size == 0:
+                os.remove(temp_path)
+                return None, "Download failed: file is empty"
+            
+            Actor.log.info(f"Downloaded {file_size} bytes, uploading to storage...")
+            
             # Upload to Apify's key-value store
             key = f"videos/{platform}_{video_id}.{ext}"
             
-            # Read file and upload
+            # Read file
             with open(temp_path, 'rb') as f:
                 file_data = f.read()
             
-            # Use the default key-value store
-            kv_store = await Actor.open_key_value_store()
-            await kv_store.set_value(key, file_data, content_type=f'video/{ext}')
+            # Use Actor's set_value method (simpler API)
+            await Actor.set_value(key, file_data, content_type=f'video/{ext}')
             
             # Clean up temp file
             os.remove(temp_path)
             
-            # Return the public URL
-            public_url = kv_store.get_public_url(key)
-            Actor.log.info(f"Video stored at: {public_url}")
+            # Build the public URL manually
+            # Format: https://api.apify.com/v2/key-value-stores/{storeId}/records/{key}
+            store_id = Actor.config.default_key_value_store_id
+            public_url = f"https://api.apify.com/v2/key-value-stores/{store_id}/records/{key}"
             
-            return public_url
-        
-    return None
+            Actor.log.info(f"Video stored successfully: {public_url}")
+            
+            return public_url, None
+            
+    except Exception as e:
+        error_msg = str(e)
+        Actor.log.error(f"Video download failed: {error_msg}")
+        return None, error_msg
+    
+    return None, "Unknown error"
 
 
 if __name__ == "__main__":
