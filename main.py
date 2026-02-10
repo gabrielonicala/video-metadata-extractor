@@ -149,7 +149,7 @@ class ExtractionResponse(BaseModel):
     timestamp: str
 
 
-def extract_twitter_metadata(url: str, use_proxy: bool = False, include_all_formats: bool = True) -> VideoMetadata:
+def extract_twitter_metadata(url: str, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
     """Extract metadata from Twitter/X using yt-dlp"""
     ydl_opts = {
         'quiet': True,
@@ -157,11 +157,13 @@ def extract_twitter_metadata(url: str, use_proxy: bool = False, include_all_form
         'extract_flat': False,
     }
     
-    # Add proxy if requested
-    if use_proxy:
-        proxy_url = get_proxy(use_scrapeops=True)
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+    # Add proxy if provided or requested
+    if proxy_url:
+        ydl_opts['proxy'] = proxy_url
+    elif use_proxy:
+        proxy = get_proxy(use_scrapeops=True)
+        if proxy:
+            ydl_opts['proxy'] = proxy
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -232,13 +234,13 @@ def extract_twitter_metadata(url: str, use_proxy: bool = False, include_all_form
         )
 
 
-def extract_twitter_comments_playwright(url: str, max_comments: int = 50) -> CommentsResponse:
-    """Extract comments from Twitter/X using Playwright browser automation
+def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: int = 50, proxy_url: Optional[str] = None) -> CommentsResponse:
+    """Extract comments from a Twitter/X post using Playwright browser automation
     
     This uses headless browser to navigate to the tweet and extract replies.
-    More reliable than yt-dlp for Twitter comments.
+    Note: This is fragile and may break if Twitter changes their UI.
     """
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
     from datetime import datetime
     import time
     import re
@@ -247,140 +249,203 @@ def extract_twitter_comments_playwright(url: str, max_comments: int = 50) -> Com
     video_title = None
     tweet_id = None
     
-    # Helper function for logging that works both in and out of Apify context
-    def log_info(msg):
+    def log(msg, level="info"):
         try:
             from apify import Actor
-            Actor.log.info(msg)
+            if level == "error":
+                Actor.log.error(msg)
+            elif level == "warning":
+                Actor.log.warning(msg)
+            else:
+                Actor.log.info(msg)
         except:
-            print(f"INFO: {msg}")
-    
-    def log_warning(msg):
-        try:
-            from apify import Actor
-            Actor.log.warning(msg)
-        except:
-            print(f"WARNING: {msg}")
-    
-    def log_error(msg):
-        try:
-            from apify import Actor
-            Actor.log.error(msg)
-        except:
-            print(f"ERROR: {msg}")
+            print(f"[{level.upper()}] {msg}")
     
     try:
+        log(f"Starting Twitter comments extraction for: {url}")
+        
         with sync_playwright() as p:
-            # Launch browser
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            # Launch browser with specific args to avoid detection
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--disable-blink-features=AutomationControlled']
             )
+            
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                viewport={'width': 1920, 'height': 1080}
+            )
+            
+            # Set extra headers to look more like a real browser
+            context.set_extra_http_headers({
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+            })
+            
             page = context.new_page()
-            
-            # Navigate to tweet with longer timeout
-            log_info(f"Navigating to {url}")
-            page.goto(url, wait_until='networkidle', timeout=30000)
-            
-            # Wait for tweet to load (increased timeout)
-            try:
-                page.wait_for_selector('article[data-testid="tweet"]', timeout=15000)
-            except Exception as e:
-                log_warning(f"Timeout waiting for tweet, trying alternative selector...")
-                # Try alternative: Twitter might have different structure
-                page.wait_for_load_state('domcontentloaded', timeout=10000)
-                time.sleep(3)  # Give extra time for JS to render
             
             # Extract tweet ID from URL
             tweet_id = url.split('/status/')[-1].split('?')[0]
+            log(f"Tweet ID: {tweet_id}")
             
-            # Try to get tweet text as title
-            try:
-                tweet_text = page.locator('article[data-testid="tweet"] div[data-testid="tweetText"]').first.text_content()
-                video_title = tweet_text[:100] if tweet_text else None
-            except:
-                pass
+            # Navigate to tweet
+            log("Navigating to tweet...")
+            page.goto(url, wait_until='domcontentloaded', timeout=30000)
             
-            # Scroll down to load comments
-            log_info("Scrolling to load comments...")
-            for _ in range(5):  # Scroll 5 times
-                page.keyboard.press('End')
-                time.sleep(1.5)  # Increased delay for loading
+            # Wait for content to load - try multiple selectors
+            log("Waiting for tweet to load...")
+            loaded = False
             
-            # Extract comments/replies
-            # Twitter uses div[data-testid="cellInnerDiv"] for reply cells
-            reply_cells = page.locator('div[data-testid="cellInnerDiv"]').all()
+            # Try different selectors for the main tweet
+            selectors = [
+                'article[data-testid="tweet"]',
+                '[data-testid="tweet"]',
+                'article[role="article"]',
+                'article'
+            ]
             
-            log_info(f"Found {len(reply_cells)} potential reply cells")
-            
-            for cell in reply_cells[:max_comments]:
+            for selector in selectors:
                 try:
-                    # Skip if it's the main tweet (not a reply)
-                    if cell.locator('article[data-testid="tweet"]').count() == 0:
+                    page.wait_for_selector(selector, timeout=5000)
+                    log(f"Found tweet using selector: {selector}")
+                    loaded = True
+                    break
+                except PlaywrightTimeout:
+                    continue
+            
+            if not loaded:
+                log("Could not find tweet with standard selectors, waiting for any article...")
+                page.wait_for_selector('article', timeout=10000)
+            
+            # Give extra time for JavaScript to render
+            time.sleep(3)
+            
+            # Extract tweet text
+            try:
+                # Try multiple selectors for tweet text
+                text_selectors = [
+                    'article[data-testid="tweet"] div[data-testid="tweetText"]',
+                    '[data-testid="tweetText"]',
+                    'article div[lang]'
+                ]
+                
+                for selector in text_selectors:
+                    try:
+                        elem = page.locator(selector).first
+                        if elem.count() > 0:
+                            text = elem.text_content()
+                            if text:
+                                video_title = text[:200]
+                                log(f"Found tweet text: {video_title[:50]}...")
+                                break
+                    except:
+                        continue
+            except Exception as e:
+                log(f"Could not extract tweet text: {e}", "warning")
+            
+            # Scroll down to load replies
+            log("Scrolling to load replies...")
+            for i in range(8):  # Scroll more times
+                page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                time.sleep(2)  # Wait for content to load
+            
+            # Give time for replies to load
+            time.sleep(3)
+            
+            # Extract replies
+            log("Extracting replies...")
+            
+            # Find all reply articles (they have a specific structure)
+            # Replies are typically in articles after the first one
+            articles = page.locator('article').all()
+            log(f"Found {len(articles)} articles on page")
+            
+            # Skip the first article (it's the main tweet)
+            reply_articles = articles[1:] if len(articles) > 1 else []
+            
+            for idx, article in enumerate(reply_articles[:max_comments]):
+                try:
+                    # Check if this is actually a reply (not a "Show more" or ad)
+                    try:
+                        # Try to find the user link
+                        user_link = article.locator('a[href^="/"]').first
+                        if user_link.count() == 0:
+                            continue
+                        
+                        href = user_link.get_attribute('href')
+                        if not href or href.startswith('/i/'):
+                            # Skip ads, topics, etc.
+                            continue
+                        
+                        author_id = href.strip('/').split('/')[0]
+                    except:
                         continue
                     
-                    # Extract author
-                    author_elem = cell.locator('a[role="link"] span').first
-                    author = author_elem.text_content() if author_elem.count() > 0 else None
-                    
-                    # Extract author ID from href
-                    author_id = None
+                    # Extract author display name
                     try:
-                        author_link = cell.locator('a[href^="/"]').first
-                        href = author_link.get_attribute('href')
-                        if href:
-                            author_id = href.strip('/').split('/')[0]
+                        author_elem = article.locator('a[role="link"] span span').first
+                        author = author_elem.text_content() if author_elem.count() > 0 else author_id
+                    except:
+                        author = author_id
+                    
+                    # Extract text
+                    text = ""
+                    try:
+                        text_elem = article.locator('[data-testid="tweetText"]').first
+                        if text_elem.count() > 0:
+                            text = text_elem.text_content() or ""
                     except:
                         pass
                     
-                    # Extract comment text
-                    text_elem = cell.locator('div[data-testid="tweetText"]').first
-                    text = text_elem.text_content() if text_elem.count() > 0 else ""
+                    # Skip if no text
+                    if not text.strip():
+                        continue
                     
-                    # Extract like count
+                    # Extract likes
                     like_count = 0
                     try:
-                        like_elem = cell.locator('button[data-testid="like"]').first
-                        like_text = like_elem.get_attribute('aria-label')
-                        if like_text:
-                            # Extract number from "X likes" or "X Likes"
-                            match = re.search(r'(\d+)', like_text.replace(',', ''))
+                        # Look for the like button and its aria-label
+                        like_btn = article.locator('button[data-testid="like"]').first
+                        if like_btn.count() > 0:
+                            aria = like_btn.get_attribute('aria-label') or ""
+                            match = re.search(r'(\d+[,.]?\d*)', aria.replace(',', ''))
                             if match:
-                                like_count = int(match.group(1))
+                                like_count = int(float(match.group(1).replace(',', '')))
                     except:
                         pass
                     
                     # Extract timestamp
                     timestamp = None
                     try:
-                        time_elem = cell.locator('time').first
-                        datetime_str = time_elem.get_attribute('datetime')
-                        if datetime_str:
-                            dt = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
-                            timestamp = int(dt.timestamp())
+                        time_elem = article.locator('time').first
+                        if time_elem.count() > 0:
+                            datetime_str = time_elem.get_attribute('datetime')
+                            if datetime_str:
+                                dt = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
+                                timestamp = int(dt.timestamp())
                     except:
                         pass
                     
-                    # Only add if we have text or author
-                    if text or author:
-                        comment = Comment(
-                            author=author,
-                            author_id=author_id,
-                            text=text,
-                            like_count=like_count,
-                            timestamp=timestamp,
-                            reply_count=0  # Twitter doesn't easily expose this
-                        )
-                        comments_list.append(comment)
+                    comment = Comment(
+                        author=author,
+                        author_id=author_id,
+                        text=text,
+                        like_count=like_count,
+                        timestamp=timestamp,
+                        reply_count=0
+                    )
+                    comments_list.append(comment)
+                    log(f"Extracted comment {len(comments_list)}: @{author_id}")
+                    
+                    if len(comments_list) >= max_comments:
+                        break
                         
-                        if len(comments_list) >= max_comments:
-                            break
-                            
                 except Exception as e:
-                    log_warning(f"Error extracting comment: {e}")
+                    log(f"Error extracting reply {idx}: {e}", "warning")
                     continue
             
             browser.close()
+            log(f"Successfully extracted {len(comments_list)} comments")
         
         return CommentsResponse(
             success=True,
@@ -392,52 +457,19 @@ def extract_twitter_comments_playwright(url: str, max_comments: int = 50) -> Com
         )
         
     except Exception as e:
-        log_error(f"Playwright extraction failed: {e}")
-        # Fall back to empty response
+        log(f"Twitter extraction failed: {e}", "error")
         return CommentsResponse(
             success=False,
             video_id=tweet_id,
             video_title=video_title,
             total_comments=0,
             comments=[],
-            error=str(e),
+            error=f"Twitter extraction failed: {str(e)}",
             timestamp=datetime.utcnow().isoformat()
         )
 
 
-def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: int = 50) -> CommentsResponse:
-    """Extract comments from a Twitter/X post using Playwright browser automation"""
-    
-    # Helper function for logging
-    def log_info(msg):
-        try:
-            from apify import Actor
-            Actor.log.info(msg)
-        except:
-            print(f"INFO: {msg}")
-    
-    def log_error(msg):
-        try:
-            from apify import Actor
-            Actor.log.error(msg)
-        except:
-            print(f"ERROR: {msg}")
-    
-    try:
-        # Try Playwright method first
-        log_info("Attempting Twitter comments extraction via Playwright...")
-        return extract_twitter_comments_playwright(url, max_comments)
-    except Exception as e:
-        log_error(f"Playwright method failed: {e}")
-        # Return empty response with error
-        return CommentsResponse(
-            success=False,
-            error=f"Could not extract Twitter comments: {str(e)}",
-            timestamp=datetime.utcnow().isoformat()
-        )
-
-
-def extract_instagram_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True) -> VideoMetadata:
+def extract_instagram_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
     """Extract metadata from Instagram using yt-dlp with enhanced error handling"""
     import re
     
@@ -456,11 +488,13 @@ def extract_instagram_metadata(url: str, cookies_file: Optional[str] = None, use
     if cookies_file and os.path.exists(cookies_file):
         ydl_opts['cookiefile'] = cookies_file
     
-    # Add proxy if requested
-    if use_proxy:
-        proxy_url = get_proxy(use_scrapeops=True)
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+    # Add proxy if provided or requested
+    if proxy_url:
+        ydl_opts['proxy'] = proxy_url
+    elif use_proxy:
+        proxy = get_proxy(use_scrapeops=True)
+        if proxy:
+            ydl_opts['proxy'] = proxy
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -578,7 +612,7 @@ def extract_instagram_metadata(url: str, cookies_file: Optional[str] = None, use
             raise
 
 
-def extract_instagram_comments(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, max_comments: int = 50) -> CommentsResponse:
+def extract_instagram_comments(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, max_comments: int = 50, proxy_url: Optional[str] = None) -> CommentsResponse:
     """Extract comments from an Instagram post/reel with enhanced error handling"""
     CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     
@@ -596,11 +630,13 @@ def extract_instagram_comments(url: str, cookies_file: Optional[str] = None, use
     if cookies_file and os.path.exists(cookies_file):
         ydl_opts['cookiefile'] = cookies_file
     
-    # Add proxy if requested
-    if use_proxy:
-        proxy_url = get_proxy(use_scrapeops=True)
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+    # Add proxy if provided or requested
+    if proxy_url:
+        ydl_opts['proxy'] = proxy_url
+    elif use_proxy:
+        proxy = get_proxy(use_scrapeops=True)
+        if proxy:
+            ydl_opts['proxy'] = proxy
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -638,7 +674,7 @@ def extract_instagram_comments(url: str, cookies_file: Optional[str] = None, use
         raise
 
 
-def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_formats: bool = True) -> VideoMetadata:
+def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
     """Extract metadata from TikTok using yt-dlp"""
     ydl_opts = {
         'quiet': True,
@@ -646,12 +682,13 @@ def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_forma
         'extract_flat': False,
     }
     
-    # Note: TikTok sometimes works better WITHOUT proxy
-    # Proxy may trigger login requirements
-    if use_proxy:
-        proxy_url = get_proxy(use_scrapeops=True)
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+    # Add proxy if provided or requested
+    if proxy_url:
+        ydl_opts['proxy'] = proxy_url
+    elif use_proxy:
+        proxy = get_proxy(use_scrapeops=True)
+        if proxy:
+            ydl_opts['proxy'] = proxy
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -724,7 +761,7 @@ def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_forma
         )
 
 
-def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int = 100) -> CommentsResponse:
+def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int = 100, proxy_url: Optional[str] = None) -> CommentsResponse:
     """Extract comments from a TikTok video using TikTokApi
     
     Note: yt-dlp's _get_comments is not implemented for TikTok (raises NotImplementedError),
@@ -810,7 +847,7 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
         )
 
 
-def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True) -> VideoMetadata:
+def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
     """Extract metadata from YouTube using yt-dlp"""
     ydl_opts = {
         'quiet': True,
@@ -820,16 +857,18 @@ def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_p
         'writeautomaticsub': True,
     }
     
-    # Add proxy if requested
-    if use_proxy:
-        proxy_url = get_proxy(use_scrapeops=True)
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
-            # Use Android client when using proxy (bypasses n-challenge)
+    # Add proxy if provided or requested
+    if proxy_url:
+        ydl_opts['proxy'] = proxy_url
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+    elif use_proxy:
+        proxy = get_proxy(use_scrapeops=True)
+        if proxy:
+            ydl_opts['proxy'] = proxy
             ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
     
     # Add cookies only if NOT using proxy (Android client doesn't support cookies)
-    if cookies_file and os.path.exists(cookies_file) and not use_proxy:
+    if cookies_file and os.path.exists(cookies_file) and not proxy_url and not use_proxy:
         ydl_opts['cookiefile'] = cookies_file
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -906,7 +945,7 @@ def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_p
         )
 
 
-def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: int = 100) -> CommentsResponse:
+def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: int = 100, proxy_url: Optional[str] = None) -> CommentsResponse:
     """Extract comments from a YouTube video"""
     ydl_opts = {
         'quiet': True,
@@ -916,11 +955,14 @@ def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: in
         'max_comments': [max_comments, max_comments, max_comments, max_comments],  # [top, newest, replies, all]
     }
     
-    # Add proxy if requested
-    if use_proxy:
-        proxy_url = get_proxy(use_scrapeops=True)
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+    # Add proxy if provided or requested
+    if proxy_url:
+        ydl_opts['proxy'] = proxy_url
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+    elif use_proxy:
+        proxy = get_proxy(use_scrapeops=True)
+        if proxy:
+            ydl_opts['proxy'] = proxy
             ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1223,12 +1265,33 @@ def stream_video_generator(url: str, platform: str, quality: str, use_proxy: boo
         info = ydl.extract_info(url, download=False)
         video_url = info['url'] if 'url' in info else info['formats'][0]['url']
         
-        # Stream the content
+        # Stream the content with browser-like headers
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'identity;q=1, *;q=0',
+            'Range': 'bytes=0-',
+            'Referer': 'https://www.tiktok.com/' if platform == 'tiktok' else 'https://www.youtube.com/' if platform == 'youtube' else 'https://twitter.com/' if platform == 'twitter' else 'https://www.instagram.com/',
+            'Origin': 'https://www.tiktok.com' if platform == 'tiktok' else 'https://www.youtube.com' if platform == 'youtube' else 'https://twitter.com' if platform == 'twitter' else 'https://www.instagram.com',
+            'Sec-Fetch-Dest': 'video',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'cross-site',
         }
         
-        with requests.get(video_url, stream=True, headers=headers) as r:
+        # Add cookies if available
+        cookies = None
+        if platform == 'instagram' and os.path.exists('instagram_cookies.txt'):
+            # Load cookies from file
+            import http.cookiejar
+            cookies = http.cookiejar.MozillaCookieJar('instagram_cookies.txt')
+            cookies.load()
+        
+        session = requests.Session()
+        if cookies:
+            session.cookies = cookies
+            
+        with session.get(video_url, stream=True, headers=headers, timeout=30) as r:
             r.raise_for_status()
             for chunk in r.iter_content(chunk_size=8192):
                 if chunk:
@@ -1283,7 +1346,11 @@ def stream_video(request: StreamRequest):
 
 # Apify Actor Entry Point
 async def apify_main():
-    """Main entry point for Apify Actor"""
+    """Main entry point for Apify Actor
+    
+    Uses Apify's built-in proxy for reliable extraction.
+    Can download videos to Apify's key-value store.
+    """
     try:
         from apify import Actor
     except ImportError:
@@ -1296,13 +1363,13 @@ async def apify_main():
         extract_comments = actor_input.get("extractComments", False)
         use_proxy = actor_input.get("useProxy", True)
         max_comments = actor_input.get("maxComments", 50)
-        stream_video = actor_input.get("streamVideo", False)
+        download_video = actor_input.get("downloadVideo", False)
         
         if not url:
             await Actor.fail("No URL provided. Please provide a video URL.")
             return
         
-        Actor.log.info(f"Processing URL: {url}")
+        await Actor.log.info(f"Processing URL: {url}")
         
         try:
             # Determine platform
@@ -1315,62 +1382,189 @@ async def apify_main():
             elif "instagram" in url_lower:
                 platform = "instagram"
             
-            Actor.log.info(f"Detected platform: {platform}")
+            await Actor.log.info(f"Detected platform: {platform}")
+            
+            # Build proxy configuration for yt-dlp
+            proxy_url = None
+            if use_proxy:
+                # Use Apify's built-in proxy
+                proxy_configuration = await Actor.create_proxy_configuration(
+                    groups=['RESIDENTIAL'],  # Use residential proxy
+                    country_code='US'  # Optional: specify country
+                )
+                if proxy_configuration:
+                    proxy_url = proxy_configuration.url
+                    await Actor.log.info("Using Apify residential proxy")
             
             # Extract video metadata
             if platform == "youtube":
-                metadata = await asyncio.to_thread(extract_youtube_metadata, url, None, use_proxy, True)
+                metadata = await asyncio.to_thread(
+                    extract_youtube_metadata, 
+                    url, 
+                    None, 
+                    proxy_url is not None,  # use_proxy flag
+                    True,  # include_all_formats
+                    proxy_url  # actual proxy URL
+                )
                 result = metadata.dict()
                 if extract_comments:
-                    Actor.log.info("Extracting comments...")
-                    comments_resp = await asyncio.to_thread(extract_youtube_comments, url, use_proxy, max_comments)
+                    await Actor.log.info("Extracting comments...")
+                    comments_resp = await asyncio.to_thread(
+                        extract_youtube_comments, 
+                        url, 
+                        proxy_url is not None,
+                        max_comments,
+                        proxy_url
+                    )
                     result["comments"] = comments_resp.comments
                     result["comments_extracted"] = len(comments_resp.comments)
+                    
             elif platform == "tiktok":
-                metadata = await asyncio.to_thread(extract_tiktok_metadata, url, False, True)
+                metadata = await asyncio.to_thread(
+                    extract_tiktok_metadata, 
+                    url, 
+                    proxy_url is not None, 
+                    True,
+                    proxy_url
+                )
                 result = metadata.dict()
                 if extract_comments:
-                    Actor.log.info("Extracting comments...")
-                    comments_resp = await asyncio.to_thread(extract_tiktok_comments, url, False, max_comments)
+                    await Actor.log.info("Extracting comments...")
+                    comments_resp = await asyncio.to_thread(
+                        extract_tiktok_comments, 
+                        url, 
+                        proxy_url is not None,
+                        max_comments,
+                        proxy_url
+                    )
                     result["comments"] = comments_resp.comments
                     result["comments_extracted"] = len(comments_resp.comments)
+                    
             elif platform == "twitter":
-                metadata = await asyncio.to_thread(extract_twitter_metadata, url, use_proxy, True)
+                metadata = await asyncio.to_thread(
+                    extract_twitter_metadata, 
+                    url, 
+                    proxy_url is not None, 
+                    True,
+                    proxy_url
+                )
                 result = metadata.dict()
                 if extract_comments:
-                    Actor.log.info("Extracting comments...")
-                    comments_resp = await asyncio.to_thread(extract_twitter_comments, url, use_proxy, max_comments)
+                    await Actor.log.info("Extracting comments...")
+                    comments_resp = await asyncio.to_thread(
+                        extract_twitter_comments, 
+                        url, 
+                        proxy_url is not None,
+                        max_comments
+                    )
                     result["comments"] = comments_resp.comments
                     result["comments_extracted"] = len(comments_resp.comments)
+                    
             else:  # instagram
-                metadata = await asyncio.to_thread(extract_instagram_metadata, url, "instagram_cookies.txt", use_proxy, True)
+                metadata = await asyncio.to_thread(
+                    extract_instagram_metadata, 
+                    url, 
+                    "instagram_cookies.txt", 
+                    proxy_url is not None, 
+                    True,
+                    proxy_url
+                )
                 result = metadata.dict()
                 if extract_comments:
-                    Actor.log.info("Extracting comments...")
-                    comments_resp = await asyncio.to_thread(extract_instagram_comments, url, "instagram_cookies.txt", use_proxy, max_comments)
+                    await Actor.log.info("Extracting comments...")
+                    comments_resp = await asyncio.to_thread(
+                        extract_instagram_comments, 
+                        url, 
+                        "instagram_cookies.txt",
+                        proxy_url is not None,
+                        max_comments,
+                        proxy_url
+                    )
                     result["comments"] = comments_resp.comments
                     result["comments_extracted"] = len(comments_resp.comments)
             
-            # Add streaming URL if requested
-            if stream_video:
-                Actor.log.info("Generating streaming URL...")
-                # Add a placeholder - actual streaming would need a separate endpoint
-                result["video_stream_url"] = f"Use the /stream endpoint with the same URL"
-                result["note"] = "To stream video, use the /stream endpoint or the standalone API server"
+            # Download video if requested
+            if download_video:
+                await Actor.log.info("Downloading video...")
+                try:
+                    video_key = f"video_{platform}_{result.get('video_id', 'unknown')}.mp4"
+                    video_url = await download_video_to_store(
+                        url, 
+                        platform, 
+                        proxy_url,
+                        Actor
+                    )
+                    if video_url:
+                        result["video_download_url"] = video_url
+                        result["video_stored"] = True
+                        await Actor.log.info(f"Video saved: {video_key}")
+                    else:
+                        result["video_stored"] = False
+                        result["video_error"] = "Could not download video"
+                except Exception as e:
+                    await Actor.log.error(f"Video download failed: {e}")
+                    result["video_stored"] = False
+                    result["video_error"] = str(e)
             
             # Add metadata
             result["platform"] = platform
             result["extracted_at"] = datetime.utcnow().isoformat()
             
-            Actor.log.info(f"Successfully extracted data from {platform}")
+            await Actor.log.info(f"Successfully extracted data from {platform}")
             
             # Push to dataset
             await Actor.push_data(result)
-            await Actor.push_data(result)
             
         except Exception as e:
-            Actor.log.error(f"Extraction failed: {str(e)}")
+            await Actor.log.error(f"Extraction failed: {str(e)}")
             await Actor.fail(str(e))
+
+
+async def download_video_to_store(url: str, platform: str, proxy_url: Optional[str], Actor) -> Optional[str]:
+    """Download video to Apify's key-value store
+    
+    Returns the public URL to access the video.
+    """
+    import tempfile
+    import os
+    
+    ydl_opts = {
+        'quiet': True,
+        'format': 'best',
+        'outtmpl': tempfile.gettempdir() + '/%(id)s.%(ext)s',
+    }
+    
+    if proxy_url:
+        ydl_opts['proxy'] = proxy_url
+    
+    if platform == 'youtube':
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+    
+    if platform == 'instagram' and os.path.exists('instagram_cookies.txt'):
+        ydl_opts['cookiefile'] = 'instagram_cookies.txt'
+    
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        video_id = info.get('id', 'video')
+        ext = info.get('ext', 'mp4')
+        
+        # Find the downloaded file
+        temp_path = os.path.join(tempfile.gettempdir(), f"{video_id}.{ext}")
+        
+        if os.path.exists(temp_path):
+            # Upload to Apify's key-value store
+            key = f"videos/{platform}_{video_id}.{ext}"
+            
+            with open(temp_path, 'rb') as f:
+                await Actor.set_value(key, f.read(), content_type=f'video/{ext}')
+            
+            # Clean up temp file
+            os.remove(temp_path)
+            
+            # Return the public URL (this will be accessible from Apify console)
+            return f"https://api.apify.com/v2/key-value-stores/{Actor.config.default_key_value_store_id}/records/{key}"
+        
+    return None
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 {
   "title": "Video Metadata Extractor",
-  "description": "Extract metadata, comments, and direct video URLs from social media platforms",
+  "description": "Extract metadata, comments, and download videos from YouTube, TikTok, Twitter/X, and Instagram",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
@@ -19,9 +19,9 @@
       "editor": "checkbox"
     },
     "useProxy": {
-      "title": "Use Proxy",
+      "title": "Use Apify Residential Proxy",
       "type": "boolean",
-      "description": "Use residential proxy for better reliability (recommended for YouTube)",
+      "description": "Use Apify's built-in residential proxy for reliable extraction (recommended)",
       "default": true,
       "editor": "checkbox"
     },
@@ -34,10 +34,10 @@
       "maximum": 500,
       "editor": "number"
     },
-    "streamVideo": {
-      "title": "Enable Video Streaming",
+    "downloadVideo": {
+      "title": "Download Video",
       "type": "boolean",
-      "description": "Include video streaming URL (consumes more bandwidth, URLs work from any IP)",
+      "description": "Download the video file to Apify storage (consumes proxy bandwidth)",
       "default": false,
       "editor": "checkbox"
     }
