@@ -1450,11 +1450,10 @@ async def apify_main():
                 if extract_comments:
                     Actor.log.info("Extracting comments...")
                     comments_resp = await asyncio.to_thread(
-                        extract_youtube_comments, 
-                        url, 
-                        proxy_url is not None,
-                        max_comments,
-                        proxy_url
+                        extract_youtube_comments,
+                        url,
+                        use_proxy,
+                        max_comments
                     )
                     result["comments"] = comments_resp.comments
                     result["comments_extracted"] = len(comments_resp.comments)
