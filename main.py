@@ -898,12 +898,12 @@ def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_p
     # Add proxy if provided or requested
     if proxy_url:
         ydl_opts['proxy'] = proxy_url
-        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web']}}
     elif use_proxy:
         proxy = get_proxy(use_scrapeops=True)
         if proxy:
             ydl_opts['proxy'] = proxy
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web']}}
     
     # Add cookies only if NOT using proxy (Android client doesn't support cookies)
     if cookies_file and os.path.exists(cookies_file) and not proxy_url and not use_proxy:
@@ -984,10 +984,8 @@ def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_p
 
 
 def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: int = 100, proxy_url: Optional[str] = None) -> CommentsResponse:
-    """Extract comments from a YouTube video using Playwright browser automation"""
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
-    from urllib.parse import urlparse
-    import time
+    """Extract comments from a YouTube video using the innertube API"""
+    import json
     import re
 
     comments_list = []
@@ -1002,6 +1000,22 @@ def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: in
         except:
             print(f"[{level.upper()}] {msg}")
 
+    def parse_count(text):
+        """Parse like/reply count strings like '1.2K', '3M', '45'"""
+        if not text:
+            return 0
+        text = text.strip().upper().replace(',', '')
+        try:
+            if 'K' in text:
+                return int(float(text.replace('K', '')) * 1000)
+            elif 'M' in text:
+                return int(float(text.replace('M', '')) * 1000000)
+            elif text.isdigit():
+                return int(text)
+        except (ValueError, TypeError):
+            pass
+        return 0
+
     try:
         # Extract video ID
         if 'v=' in url:
@@ -1011,185 +1025,194 @@ def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: in
 
         log(f"Extracting YouTube comments for: {url}")
 
-        with sync_playwright() as p:
-            launch_opts = {
-                'headless': True,
-                'args': ['--disable-blink-features=AutomationControlled', '--no-sandbox']
+        session = requests.Session()
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        }
+        proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
+
+        # Step 1: Fetch YouTube page to get continuation token
+        log("Fetching YouTube page...")
+        resp = session.get(
+            f'https://www.youtube.com/watch?v={video_id}',
+            headers=headers,
+            proxies=proxies,
+            timeout=30
+        )
+        resp.raise_for_status()
+
+        # Step 2: Extract ytInitialData
+        match = re.search(r'var ytInitialData\s*=\s*', resp.text)
+        if not match:
+            raise Exception("Could not find ytInitialData in page")
+        start = match.end()
+        end = resp.text.find(';</script>', start)
+        if end == -1:
+            raise Exception("Could not parse ytInitialData")
+        initial_data = json.loads(resp.text[start:end])
+
+        # Step 3: Extract video title
+        try:
+            contents = initial_data['contents']['twoColumnWatchNextResults']['results']['results']['contents']
+            for item in contents:
+                if 'videoPrimaryInfoRenderer' in item:
+                    runs = item['videoPrimaryInfoRenderer']['title'].get('runs', [])
+                    video_title = ''.join(r.get('text', '') for r in runs)
+                    break
+        except (KeyError, IndexError):
+            pass
+
+        # Step 4: Find continuation token for comments
+        continuation_token = None
+        try:
+            contents = initial_data['contents']['twoColumnWatchNextResults']['results']['results']['contents']
+            for item in contents:
+                if 'itemSectionRenderer' in item:
+                    section = item['itemSectionRenderer']
+                    for content in section.get('contents', []):
+                        if 'continuationItemRenderer' in content:
+                            continuation_token = content['continuationItemRenderer']['continuationEndpoint']['continuationCommand']['token']
+                            break
+                    if continuation_token:
+                        break
+        except (KeyError, IndexError):
+            pass
+
+        if not continuation_token:
+            raise Exception("Could not find comments continuation token")
+
+        # Step 5: Fetch comments via innertube API (with pagination)
+        api_url = 'https://www.youtube.com/youtubei/v1/next'
+        api_headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': headers['User-Agent'],
+            'X-YouTube-Client-Name': '1',
+            'X-YouTube-Client-Version': '2.20240101.00.00',
+        }
+
+        page_num = 0
+        while continuation_token and len(comments_list) < max_comments:
+            page_num += 1
+            log(f"Fetching comments page {page_num}...")
+
+            payload = {
+                'context': {
+                    'client': {
+                        'clientName': 'WEB',
+                        'clientVersion': '2.20240101.00.00',
+                        'hl': 'en',
+                        'gl': 'US',
+                    }
+                },
+                'continuation': continuation_token,
             }
 
-            if proxy_url:
-                parsed = urlparse(proxy_url)
-                proxy_config = {'server': f'{parsed.scheme}://{parsed.hostname}:{parsed.port}'}
-                if parsed.username:
-                    proxy_config['username'] = parsed.username
-                if parsed.password:
-                    proxy_config['password'] = parsed.password
-                launch_opts['proxy'] = proxy_config
-
-            browser = p.chromium.launch(**launch_opts)
-            context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                viewport={'width': 1920, 'height': 1080}
+            api_resp = session.post(
+                api_url,
+                json=payload,
+                headers=api_headers,
+                proxies=proxies,
+                timeout=30,
             )
-            context.set_extra_http_headers({'Accept-Language': 'en-US,en;q=0.9'})
-            page = context.new_page()
+            api_resp.raise_for_status()
+            data = api_resp.json()
 
-            # Navigate to video
-            log("Navigating to YouTube video...")
-            page.goto(url, wait_until='domcontentloaded', timeout=30000)
-
-            # Dismiss cookie consent if present
-            try:
-                consent = page.locator('button:has-text("Accept all"), button:has-text("Accept")').first
-                if consent.count() > 0:
-                    consent.click(timeout=3000)
-                    time.sleep(1)
-            except:
-                pass
-
-            # Wait for video page to load
-            try:
-                page.wait_for_selector('#player, ytd-watch-flexy', timeout=15000)
-            except PlaywrightTimeout:
-                log("Page didn't fully load, continuing...", "warning")
-
-            # Get video title
-            try:
-                title_el = page.locator('h1 yt-formatted-string').first
-                if title_el.count() > 0:
-                    video_title = title_el.text_content()
-            except:
-                pass
-
-            # Scroll to trigger comment loading
-            log("Scrolling to load comments...")
-            page.evaluate('window.scrollTo(0, 500)')
-            time.sleep(1)
-            page.evaluate('window.scrollTo(0, 800)')
-            time.sleep(2)
-
-            # Wait for comments section
-            comment_loaded = False
-            try:
-                page.wait_for_selector('ytd-comment-thread-renderer', timeout=10000)
-                comment_loaded = True
-                log("Comments section loaded")
-            except PlaywrightTimeout:
-                log("Comments didn't load, scrolling more...", "warning")
-                for _ in range(3):
-                    page.evaluate('window.scrollBy(0, 600)')
-                    time.sleep(2)
-                try:
-                    page.wait_for_selector('ytd-comment-thread-renderer', timeout=10000)
-                    comment_loaded = True
-                except PlaywrightTimeout:
-                    log("Could not load comments section", "error")
-
-            if comment_loaded:
-                # Get total comment count
-                try:
-                    count_el = page.locator('ytd-comments-header-renderer h2 yt-formatted-string span').first
-                    if count_el.count() > 0:
-                        ct = count_el.text_content() or ""
-                        m = re.search(r'[\d,]+', ct.replace(',', ''))
-                        if m:
-                            total_comments = int(m.group().replace(',', ''))
-                except:
-                    pass
-
-                # Scroll until we have enough comments or hit timeout
-                deadline = time.time() + 60
-                prev_count = 0
-                stale_rounds = 0
-
-                for _ in range(20):
-                    if time.time() > deadline:
-                        log("Hit 60-second scroll timeout")
-                        break
-                    cur = page.locator('ytd-comment-thread-renderer').count()
-                    if cur >= max_comments:
-                        break
-                    if cur == prev_count:
-                        stale_rounds += 1
-                        if stale_rounds >= 3:
-                            log("No new comments loading, stopping scroll")
-                            break
-                    else:
-                        stale_rounds = 0
-                    prev_count = cur
-                    page.evaluate('window.scrollBy(0, 800)')
-                    time.sleep(1.5)
-
-                # Extract comments from DOM
-                elements = page.locator('ytd-comment-thread-renderer').all()
-                log(f"Extracting from {len(elements)} comment elements")
-
-                for idx, el in enumerate(elements[:max_comments]):
-                    try:
-                        author = author_id = None
+            # Parse comments from response
+            next_continuation = None
+            for endpoint in data.get('onResponseReceivedEndpoints', []):
+                items = (
+                    endpoint.get('reloadContinuationItemsAction', {}).get('continuationItems', [])
+                    or endpoint.get('appendContinuationItemsAction', {}).get('continuationItems', [])
+                )
+                for item in items:
+                    # Check for next page continuation token
+                    if 'continuationItemRenderer' in item:
                         try:
-                            a_el = el.locator('#author-text').first
-                            if a_el.count() > 0:
-                                author = (a_el.text_content() or "").strip()
-                                href = a_el.get_attribute('href') or ""
-                                if '/@' in href:
-                                    author_id = href.split('/@')[1].split('/')[0]
-                                elif '/channel/' in href:
-                                    author_id = href.split('/channel/')[1].split('/')[0]
-                        except:
+                            next_continuation = item['continuationItemRenderer']['continuationEndpoint']['continuationCommand']['token']
+                        except (KeyError, TypeError):
                             pass
-
-                        text = ""
-                        try:
-                            t_el = el.locator('#content-text').first
-                            if t_el.count() > 0:
-                                text = (t_el.text_content() or "").strip()
-                        except:
-                            pass
-
-                        if not text:
-                            continue
-
-                        like_count = 0
-                        try:
-                            lk_el = el.locator('#vote-count-middle').first
-                            if lk_el.count() > 0:
-                                lt = (lk_el.text_content() or "").strip().upper().replace(',', '')
-                                if lt:
-                                    if 'K' in lt:
-                                        like_count = int(float(lt.replace('K', '')) * 1000)
-                                    elif 'M' in lt:
-                                        like_count = int(float(lt.replace('M', '')) * 1000000)
-                                    elif lt.isdigit():
-                                        like_count = int(lt)
-                        except:
-                            pass
-
-                        reply_count = 0
-                        try:
-                            rb = el.locator('#more-replies button, ytd-comment-replies-renderer button').first
-                            if rb.count() > 0:
-                                rt = rb.text_content() or ""
-                                rm = re.search(r'(\d+)', rt)
-                                if rm:
-                                    reply_count = int(rm.group(1))
-                        except:
-                            pass
-
-                        comments_list.append(Comment(
-                            author=author,
-                            author_id=author_id,
-                            text=text,
-                            like_count=like_count,
-                            timestamp=None,
-                            reply_count=reply_count
-                        ))
-                    except Exception as e:
-                        log(f"Error on comment {idx}: {e}", "warning")
                         continue
 
-            browser.close()
-            log(f"Extracted {len(comments_list)} YouTube comments")
+                    thread = item.get('commentThreadRenderer', {})
+                    if not thread:
+                        continue
+
+                    renderer = thread.get('comment', {}).get('commentRenderer', {})
+                    if not renderer:
+                        continue
+
+                    # Author
+                    author = renderer.get('authorText', {}).get('simpleText', '')
+                    author_id = renderer.get('authorEndpoint', {}).get('browseEndpoint', {}).get('browseId', '')
+
+                    # Text
+                    text_runs = renderer.get('contentText', {}).get('runs', [])
+                    text = ''.join(run.get('text', '') for run in text_runs)
+                    if not text:
+                        continue
+
+                    # Likes
+                    like_text = renderer.get('voteCount', {}).get('simpleText', '0')
+                    like_count = parse_count(like_text)
+
+                    # Reply count
+                    reply_count = 0
+                    reply_renderer = thread.get('replies', {}).get('commentRepliesRenderer', {})
+                    if reply_renderer:
+                        try:
+                            for btn_key in ['viewReplies', 'hideReplies']:
+                                btn = reply_renderer.get(btn_key, {}).get('buttonRenderer', {})
+                                reply_text = btn.get('text', {}).get('runs', [{}])[0].get('text', '')
+                                rm = re.search(r'[\d,]+', reply_text.replace(',', ''))
+                                if rm:
+                                    reply_count = int(rm.group())
+                                    break
+                        except (KeyError, IndexError):
+                            pass
+
+                    # Timestamp
+                    timestamp = None
+                    try:
+                        time_text = renderer.get('publishedTimeText', {}).get('runs', [{}])[0].get('text', '')
+                        if time_text:
+                            timestamp = time_text
+                    except (KeyError, IndexError):
+                        pass
+
+                    comments_list.append(Comment(
+                        author=author,
+                        author_id=author_id,
+                        text=text,
+                        like_count=like_count,
+                        timestamp=timestamp,
+                        reply_count=reply_count,
+                    ))
+
+                    if len(comments_list) >= max_comments:
+                        break
+
+            # Move to next page or stop
+            continuation_token = next_continuation if len(comments_list) < max_comments else None
+
+        # Get total comment count from header if available
+        try:
+            for endpoint in data.get('onResponseReceivedEndpoints', []):
+                header_items = endpoint.get('reloadContinuationItemsAction', {}).get('continuationItems', [])
+                for item in header_items:
+                    header = item.get('commentsHeaderRenderer', {})
+                    if header:
+                        count_runs = header.get('countText', {}).get('runs', [])
+                        if count_runs:
+                            count_text = count_runs[0].get('text', '').replace(',', '')
+                            cm = re.search(r'[\d]+', count_text)
+                            if cm:
+                                total_comments = int(cm.group())
+        except:
+            pass
+
+        log(f"Extracted {len(comments_list)} YouTube comments")
 
         return CommentsResponse(
             success=True,
@@ -1475,7 +1498,7 @@ def stream_video_generator(url: str, platform: str, quality: str, use_proxy: boo
         if proxy_url:
             ydl_opts['proxy'] = proxy_url
             if platform == 'youtube':
-                ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+                ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web']}}
     
     # Platform-specific options
     if platform == 'instagram':
@@ -1764,7 +1787,7 @@ async def download_video_to_store(url: str, platform: str, proxy_url: Optional[s
             ydl_opts['proxy'] = proxy_url
         
         if platform == 'youtube':
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web']}}
         
         if platform == 'instagram' and os.path.exists('instagram_cookies.txt'):
             ydl_opts['cookiefile'] = 'instagram_cookies.txt'
