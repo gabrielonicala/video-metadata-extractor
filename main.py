@@ -1209,6 +1209,19 @@ def download_video_file(url: str, platform: str, proxy_url: Optional[str] = None
     return None
 
 
+def _try_extract_comments(platform: str, url: str, max_comments: int, proxy_url: Optional[str] = None) -> 'CommentsResponse':
+    """Dispatch comment extraction to the right platform function."""
+    if platform == "youtube":
+        return extract_youtube_comments(url, False, max_comments, proxy_url)
+    elif platform == "tiktok":
+        return extract_tiktok_comments(url, False, max_comments, proxy_url)
+    elif platform == "twitter":
+        return extract_twitter_comments(url, False, max_comments, proxy_url)
+    elif platform == "instagram":
+        return extract_instagram_comments(url, None, False, max_comments, proxy_url)
+    raise ValueError(f"Unsupported platform: {platform}")
+
+
 # Apify Actor Entry Point
 async def apify_main():
     """Main entry point for Apify Actor"""
@@ -1282,36 +1295,54 @@ async def apify_main():
 
             result = metadata.model_dump()
 
-            # Extract comments if requested - fresh proxy URL
+            # Extract comments if requested
+            # Comment APIs are sensitive to proxy choice - use a fallback chain:
+            #   1. No proxy (datacenter IP - works for Twitter, sometimes YouTube)
+            #   2. ScrapeOps proxy (proven to work for YouTube comments)
+            #   3. Apify residential proxy (last resort)
             if extract_comments:
                 Actor.log.info(f"Extracting up to {max_comments} comments...")
-                proxy_url = await fresh_proxy()
-                try:
-                    if platform == "youtube":
-                        comments_resp = await asyncio.to_thread(
-                            extract_youtube_comments, url, False, max_comments, proxy_url
-                        )
-                    elif platform == "tiktok":
-                        comments_resp = await asyncio.to_thread(
-                            extract_tiktok_comments, url, False, max_comments, proxy_url
-                        )
-                    elif platform == "twitter":
-                        comments_resp = await asyncio.to_thread(
-                            extract_twitter_comments, url, False, max_comments, proxy_url
-                        )
-                    elif platform == "instagram":
-                        comments_resp = await asyncio.to_thread(
-                            extract_instagram_comments, url, None, False, max_comments, proxy_url
-                        )
+                comments_resp = None
 
-                    # Serialize Comment objects to dicts
+                strategies = [
+                    ("no proxy", None),
+                    ("ScrapeOps proxy", SCRAPEOPS_PROXY),
+                ]
+
+                for strategy_name, strategy_proxy in strategies:
+                    try:
+                        Actor.log.info(f"Comments: trying {strategy_name}...")
+                        comments_resp = await asyncio.to_thread(
+                            _try_extract_comments, platform, url, max_comments, strategy_proxy
+                        )
+                        if comments_resp and comments_resp.comments:
+                            Actor.log.info(f"Got {len(comments_resp.comments)} comments via {strategy_name}")
+                            break
+                    except Exception as e:
+                        Actor.log.info(f"Comments {strategy_name}: {e}")
+                        comments_resp = None
+
+                # Last resort: Apify residential proxy
+                if not (comments_resp and comments_resp.comments):
+                    proxy_url = await fresh_proxy()
+                    if proxy_url:
+                        try:
+                            Actor.log.info("Comments: trying residential proxy...")
+                            comments_resp = await asyncio.to_thread(
+                                _try_extract_comments, platform, url, max_comments, proxy_url
+                            )
+                            if comments_resp and comments_resp.comments:
+                                Actor.log.info(f"Got {len(comments_resp.comments)} comments via residential proxy")
+                        except Exception as e:
+                            Actor.log.warning(f"All comment strategies failed. Last: {e}")
+
+                if comments_resp and comments_resp.comments:
                     result["comments"] = [c.model_dump() for c in comments_resp.comments]
                     result["comments_extracted"] = len(comments_resp.comments)
-                except Exception as e:
-                    Actor.log.warning(f"Comment extraction failed: {e}")
+                else:
                     result["comments"] = []
                     result["comments_extracted"] = 0
-                    result["comments_error"] = str(e)
+                    result["comments_error"] = "Could not extract comments with any proxy strategy"
 
             # Download video if requested - fresh proxy URL with retry
             if download_video:
