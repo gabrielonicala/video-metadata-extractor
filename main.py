@@ -578,8 +578,14 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
         total_comments = None
         
         async with TikTokApi() as api:
-            # Create session with headless browser
-            await api.create_sessions(headless=True, ms_tokens=[''], num_sessions=1)
+            # Create session - NO proxy for TikTokApi, it uses its own browser
+            # Increased timeout by using custom browser args
+            await api.create_sessions(
+                headless=True, 
+                ms_tokens=[''], 
+                num_sessions=1,
+                sleep_after=3  # Wait 3 seconds after page load
+            )
             
             video = api.video(url=url)
             
@@ -592,40 +598,55 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
             except Exception as e:
                 print(f"Warning: Could not get video info: {e}")
             
-            # Fetch comments
+            # Fetch comments with timeout protection
             count = 0
-            async for comment in video.comments(count=max_comments):
-                comment_dict = comment.as_dict
-                
-                # Extract author info from nested structure
-                author = comment_dict.get('user', {}).get('nickname') or comment_dict.get('user', {}).get('uniqueId')
-                author_id = comment_dict.get('user', {}).get('uniqueId') or comment_dict.get('user', {}).get('secUid')
-                
-                # Extract other fields
-                text = comment_dict.get('text', '')
-                like_count = comment_dict.get('diggCount', 0)
-                timestamp = comment_dict.get('createTime')
-                reply_count = comment_dict.get('replyCommentTotal', 0)
-                
-                comment_obj = Comment(
-                    author=author,
-                    author_id=author_id,
-                    text=text,
-                    like_count=like_count,
-                    timestamp=timestamp,
-                    reply_count=reply_count
-                )
-                comments_list.append(comment_obj)
-                count += 1
-                
-                if count >= max_comments:
-                    break
+            try:
+                async for comment in video.comments(count=max_comments):
+                    try:
+                        comment_dict = comment.as_dict
+                        
+                        # Extract author info from nested structure
+                        author = comment_dict.get('user', {}).get('nickname') or comment_dict.get('user', {}).get('uniqueId')
+                        author_id = comment_dict.get('user', {}).get('uniqueId') or comment_dict.get('user', {}).get('secUid')
+                        
+                        # Extract other fields
+                        text = comment_dict.get('text', '')
+                        like_count = comment_dict.get('diggCount', 0)
+                        timestamp = comment_dict.get('createTime')
+                        reply_count = comment_dict.get('replyCommentTotal', 0)
+                        
+                        comment_obj = Comment(
+                            author=author,
+                            author_id=author_id,
+                            text=text,
+                            like_count=like_count,
+                            timestamp=timestamp,
+                            reply_count=reply_count
+                        )
+                        comments_list.append(comment_obj)
+                        count += 1
+                        
+                        if count >= max_comments:
+                            break
+                    except Exception as e:
+                        print(f"Warning: Error processing comment: {e}")
+                        continue
+            except Exception as e:
+                print(f"Warning: Error fetching comments: {e}")
         
         return comments_list, video_title, video_id, total_comments
     
-    # Run the async function
+    # Run the async function with timeout
     try:
-        comments_list, video_title, video_id, total_comments = asyncio.run(_fetch_comments())
+        # Use asyncio.wait_for to add overall timeout
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # 120 second timeout for entire operation
+        comments_list, video_title, video_id, total_comments = loop.run_until_complete(
+            asyncio.wait_for(_fetch_comments(), timeout=120)
+        )
+        loop.close()
         
         return CommentsResponse(
             success=True,
@@ -633,6 +654,16 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
             video_title=video_title,
             total_comments=total_comments or len(comments_list),
             comments=comments_list,
+            timestamp=datetime.utcnow().isoformat()
+        )
+    except asyncio.TimeoutError:
+        return CommentsResponse(
+            success=False,
+            video_id=None,
+            video_title=None,
+            total_comments=0,
+            comments=[],
+            error="TikTok comments extraction timed out after 120 seconds. TikTok may be blocking automated access.",
             timestamp=datetime.utcnow().isoformat()
         )
     except Exception as e:
@@ -643,7 +674,7 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
             video_title=None,
             total_comments=0,
             comments=[],
-            error=str(e),
+            error=f"TikTok comments extraction failed: {str(e)}",
             timestamp=datetime.utcnow().isoformat()
         )
 
@@ -1182,6 +1213,52 @@ def get_best_video_url(url: str, platform: str, proxy_url: Optional[str] = None)
     return None
 
 
+def download_video_file(url: str, platform: str, proxy_url: Optional[str] = None) -> Optional[Dict]:
+    """Download video file to memory and return content + metadata"""
+    import tempfile
+    import os
+    
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'format': 'best[ext=mp4]/best',
+        'outtmpl': tempfile.gettempdir() + '/%(id)s.%(ext)s',
+    }
+    
+    if proxy_url:
+        ydl_opts['proxy'] = proxy_url
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Get info first
+            info = ydl.extract_info(url, download=False)
+            video_id = info.get('id', 'unknown')
+            ext = info.get('ext', 'mp4')
+            
+            # Download to temp file
+            ydl.download([url])
+            
+            # Find the downloaded file
+            temp_path = os.path.join(tempfile.gettempdir(), f"{video_id}.{ext}")
+            if os.path.exists(temp_path):
+                with open(temp_path, 'rb') as f:
+                    content = f.read()
+                
+                # Clean up temp file
+                os.remove(temp_path)
+                
+                return {
+                    'content': content,
+                    'ext': ext,
+                    'video_id': video_id,
+                    'size': len(content)
+                }
+    except Exception as e:
+        print(f"Error downloading video: {e}")
+    
+    return None
+
+
 # Apify Actor Entry Point
 async def apify_main():
     """Main entry point for Apify Actor"""
@@ -1246,8 +1323,9 @@ async def apify_main():
                 metadata = await asyncio.to_thread(extract_tiktok_metadata, url, needs_proxy, True)
                 result = metadata.model_dump()
                 if extract_comments:
-                    Actor.log.info("Extracting comments...")
-                    comments_resp = await asyncio.to_thread(extract_tiktok_comments, url, needs_proxy, max_comments)
+                    Actor.log.info("Extracting TikTok comments (no proxy)...")
+                    # Don't pass proxy to TikTok comments - it uses its own browser
+                    comments_resp = await asyncio.to_thread(extract_tiktok_comments, url, False, max_comments)
                     result["comments"] = comments_resp.comments
                     result["comments_extracted"] = len(comments_resp.comments)
                     
@@ -1260,22 +1338,39 @@ async def apify_main():
                     result["comments"] = comments_resp.comments
                     result["comments_extracted"] = len(comments_resp.comments)
             
-            # Download video if requested
+            # Download video if requested - actually download to key-value store
             if download_video:
-                Actor.log.info("Downloading video...")
+                Actor.log.info("Downloading video to key-value store...")
                 try:
-                    video_url = await asyncio.to_thread(get_best_video_url, url, platform, proxy_url)
-                    if video_url:
-                        # Store video URL in result
-                        result["video_download_url"] = video_url
-                        result["video_direct_url"] = True
-                        Actor.log.info("Video URL extracted successfully")
+                    # Download video file
+                    video_data = await asyncio.to_thread(download_video_file, url, platform, proxy_url)
+                    if video_data:
+                        # Store in key-value store
+                        kv_store = await Actor.open_key_value_store()
+                        video_id = result.get('video_id', 'unknown')
+                        ext = video_data.get('ext', 'mp4')
+                        key = f"videos/{platform}_{video_id}.{ext}"
+                        
+                        await kv_store.set_value(
+                            key, 
+                            video_data['content'], 
+                            content_type=f"video/{ext}"
+                        )
+                        
+                        # Get public URL
+                        public_url = f"https://api.apify.com/v2/key-value-stores/{Actor.config.default_key_value_store_id}/records/{key}"
+                        
+                        result["video_key"] = key
+                        result["video_url"] = public_url
+                        result["video_stored"] = True
+                        result["video_size_mb"] = round(len(video_data['content']) / (1024*1024), 2)
+                        Actor.log.info(f"Video stored: {key} ({result['video_size_mb']} MB)")
                     else:
-                        result["video_error"] = "Could not extract video URL"
-                        result["video_direct_url"] = False
+                        result["video_error"] = "Could not download video"
+                        result["video_stored"] = False
                 except Exception as e:
                     result["video_error"] = str(e)
-                    result["video_direct_url"] = False
+                    result["video_stored"] = False
                     Actor.log.error(f"Video download failed: {e}")
             
             # Add metadata
