@@ -764,13 +764,16 @@ def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_forma
 def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int = 100, proxy_url: Optional[str] = None) -> CommentsResponse:
     """Extract comments from a TikTok video using TikTokApi
     
-    Note: yt-dlp's _get_comments is not implemented for TikTok (raises NotImplementedError),
-    so we use TikTokApi which uses browser automation to fetch comments.
-    
-    Note: TikTokApi doesn't use the proxy since it uses browser automation.
+    Uses TikTok-Api library with browser automation to fetch comments.
+    Reference: https://github.com/davidteather/TikTok-Api
     """
     import asyncio
+    import nest_asyncio
     from TikTokApi import TikTokApi
+    from datetime import datetime
+    
+    # Apply nest_asyncio to allow nested event loops
+    nest_asyncio.apply()
     
     async def _fetch_comments():
         comments_list = []
@@ -778,100 +781,138 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
         video_id = None
         total_comments = None
         
+        # Extract video ID from URL
         try:
-            async with TikTokApi() as api:
-                # Create session with headless browser - increased timeout
-                await api.create_sessions(
-                    headless=True, 
-                    ms_tokens=[''], 
-                    num_sessions=1,
-                    sleep_after=3  # Wait a bit after creating session
-                )
-                
-                video = api.video(url=url)
-                
-                # Get video info for title
+            if '/video/' in url:
+                video_id = url.split('/video/')[-1].split('?')[0].split('/')[0]
+        except:
+            pass
+        
+        try:
+            # Initialize TikTokApi with custom parameters
+            api = TikTokApi()
+            
+            # Create session with increased timeout and better parameters
+            # Using browser_args to help avoid detection
+            await api.create_sessions(
+                headless=True,
+                ms_tokens=[''],  # Empty ms_tokens, will be generated
+                num_sessions=1,
+                browser_args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-web-security',
+                    '--disable-features=IsolateOrigins,site-per-process',
+                ]
+            )
+            
+            # Get the video object
+            video = api.video(id=video_id) if video_id else api.video(url=url)
+            
+            # Get video info first
+            try:
+                info = await video.info()
+                if info:
+                    video_title = info.get('desc', '')[:200] if info.get('desc') else None
+                    total_comments = info.get('commentCount', 0)
+                    # Update video_id if we got it from info
+                    if info.get('id'):
+                        video_id = info.get('id')
+            except Exception as e:
+                print(f"Warning: Could not get video info: {e}")
+            
+            # Fetch comments
+            count = 0
+            async for comment in video.comments(count=max_comments):
                 try:
-                    info = await video.info()
-                    video_title = info.get('desc', '')[:100] if info else None
-                    video_id = info.get('id') if info else None
-                    total_comments = info.get('commentCount') if info else None
+                    comment_dict = comment.as_dict if hasattr(comment, 'as_dict') else comment
+                    
+                    # Extract author info
+                    user_info = comment_dict.get('user', {})
+                    author = user_info.get('nickname') or user_info.get('uniqueId') or 'Unknown'
+                    author_id = user_info.get('uniqueId') or user_info.get('secUid') or ''
+                    
+                    # Extract comment text
+                    text = comment_dict.get('text', '')
+                    
+                    # Extract likes
+                    like_count = comment_dict.get('diggCount', 0) or comment_dict.get('likes', 0)
+                    
+                    # Extract timestamp
+                    timestamp = comment_dict.get('createTime')
+                    
+                    # Extract reply count
+                    reply_count = comment_dict.get('replyCommentTotal', 0) or comment_dict.get('reply_count', 0)
+                    
+                    comment_obj = Comment(
+                        author=author,
+                        author_id=author_id,
+                        text=text,
+                        like_count=like_count,
+                        timestamp=timestamp,
+                        reply_count=reply_count
+                    )
+                    comments_list.append(comment_obj)
+                    count += 1
+                    
+                    if count >= max_comments:
+                        break
+                        
                 except Exception as e:
-                    print(f"Warning: Could not get video info: {e}")
-                
-                # Fetch comments with timeout handling
-                count = 0
-                try:
-                    async for comment in video.comments(count=max_comments):
-                        try:
-                            comment_dict = comment.as_dict
-                            
-                            # Extract author info from nested structure
-                            author = comment_dict.get('user', {}).get('nickname') or comment_dict.get('user', {}).get('uniqueId')
-                            author_id = comment_dict.get('user', {}).get('uniqueId') or comment_dict.get('user', {}).get('secUid')
-                            
-                            # Extract other fields
-                            text = comment_dict.get('text', '')
-                            like_count = comment_dict.get('diggCount', 0)
-                            timestamp = comment_dict.get('createTime')
-                            reply_count = comment_dict.get('replyCommentTotal', 0)
-                            
-                            comment_obj = Comment(
-                                author=author,
-                                author_id=author_id,
-                                text=text,
-                                like_count=like_count,
-                                timestamp=timestamp,
-                                reply_count=reply_count
-                            )
-                            comments_list.append(comment_obj)
-                            count += 1
-                            
-                            if count >= max_comments:
-                                break
-                        except Exception as e:
-                            print(f"Warning: Error processing comment: {e}")
-                            continue
-                except Exception as e:
-                    print(f"Warning: Error fetching comments: {e}")
+                    print(f"Warning: Error processing individual comment: {e}")
+                    continue
+            
+            # Close the API session
+            await api.close_sessions()
+            
         except Exception as e:
-            print(f"Warning: TikTokApi session creation failed: {e}")
+            print(f"Error in TikTok API: {e}")
+            import traceback
+            traceback.print_exc()
         
         return comments_list, video_title, video_id, total_comments
     
-    # Run the async function with timeout
+    # Run the async function
     try:
-        comments_list, video_title, video_id, total_comments = asyncio.run(_fetch_comments())
+        # Create new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        comments_list, video_title, video_id, total_comments = loop.run_until_complete(_fetch_comments())
+        loop.close()
+        
+        if len(comments_list) > 0:
+            return CommentsResponse(
+                success=True,
+                video_id=video_id,
+                video_title=video_title,
+                total_comments=total_comments or len(comments_list),
+                comments=comments_list,
+                timestamp=datetime.utcnow().isoformat()
+            )
+        else:
+            return CommentsResponse(
+                success=False,
+                video_id=video_id,
+                video_title=video_title,
+                total_comments=0,
+                comments=[],
+                error="No comments extracted. TikTok may be blocking automated access.",
+                timestamp=datetime.utcnow().isoformat()
+            )
+            
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Error extracting TikTok comments: {error_msg}")
+        import traceback
+        traceback.print_exc()
         
         return CommentsResponse(
-            success=True,
-            video_id=video_id,
-            video_title=video_title,
-            total_comments=total_comments or len(comments_list),
-            comments=comments_list,
-            timestamp=datetime.utcnow().isoformat()
-        )
-    except Exception as e:
-        # Return empty comments on error
-        print(f"Error extracting TikTok comments: {e}")
-        return CommentsResponse(
             success=False,
             video_id=None,
             video_title=None,
             total_comments=0,
             comments=[],
-            error=str(e),
-            timestamp=datetime.utcnow().isoformat()
-        )
-    except Exception as e:
-        # Return error response
-        return CommentsResponse(
-            success=False,
-            video_id=None,
-            video_title=None,
-            total_comments=0,
-            comments=[],
-            error=str(e),
+            error=f"TikTok comments extraction failed: {error_msg}",
             timestamp=datetime.utcnow().isoformat()
         )
 
@@ -1624,12 +1665,20 @@ async def download_video_to_storage(url: str, platform: str, proxy_url: Optional
             
             # Get the public URL with signature
             # This generates a signed URL that works from any IP
-            kv_store = await Actor.open_key_value_store()
-            signed_url = kv_store.get_public_url(key)
-            
-            Actor.log.info(f"Video stored successfully")
-            
-            return str(signed_url), None
+            try:
+                kv_store = await Actor.open_key_value_store()
+                signed_url = kv_store.get_public_url(key)
+                Actor.log.info(f"Video stored successfully")
+                return str(signed_url), None
+            except Exception as e:
+                Actor.log.warning(f"Could not get signed URL: {e}")
+                # Fallback: construct URL manually
+                try:
+                    store_id = Actor.config.default_key_value_store_id
+                    fallback_url = f"https://api.apify.com/v2/key-value-stores/{store_id}/records/{key}"
+                    return fallback_url, None
+                except:
+                    return None, f"Could not generate download URL: {e}"
             
     except Exception as e:
         error_msg = str(e)

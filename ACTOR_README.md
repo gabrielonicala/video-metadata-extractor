@@ -15,7 +15,7 @@ Extract comprehensive metadata, comments, and download videos from YouTube, TikT
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `url` | string | Yes | - | Video URL (YouTube, TikTok, Twitter/X, or Instagram) |
-| `extractComments` | boolean | No | false | Also extract video comments |
+| `extractComments` | boolean | No | true | Extract video comments |
 | `useProxy` | boolean | No | true | Use Apify's built-in residential proxy (recommended) |
 | `maxComments` | integer | No | 50 | Maximum comments to extract (1-500) |
 | `downloadVideo` | boolean | No | false | Download video to Apify storage (max 500MB) |
@@ -32,7 +32,7 @@ Returns JSON with:
 - `uploader` - Creator/channel name
 - `platform` - Source platform
 - `formats` - Available video formats with direct URLs
-- `comments` - Array of comments (if requested)
+- `comments` - Array of comments (if extraction successful)
 - `video_download_url` - Signed URL to downloaded video (if downloadVideo enabled)
 - `video_stored` - Boolean indicating if video was successfully stored
 - `video_error` - Error message if download failed
@@ -42,9 +42,12 @@ Returns JSON with:
 | Platform | Video | Comments | Download | Notes |
 |----------|-------|----------|----------|-------|
 | YouTube | ✅ | ✅ | ✅ | Best reliability with proxy |
-| TikTok | ✅ | ✅ | ✅ | Uses browser automation for comments |
+| TikTok | ✅ | ✅ | ✅ | Uses TikTok-Api library |
 | Twitter/X | ✅ | ✅ | ✅ | No auth required |
 | Instagram | ✅ | ✅* | ✅* | *Requires cookies for most content |
+
+### About TikTok Comments
+TikTok comments are extracted using the [TikTok-Api](https://github.com/davidteather/TikTok-Api) library with browser automation. While we strive for reliability, TikTok's anti-bot measures may occasionally cause extraction to fail.
 
 ### About Apify Residential Proxy
 
@@ -62,7 +65,7 @@ When `downloadVideo` is enabled:
 - Signed URLs work from any IP and don't expire
 - Files are limited to 500MB (to prevent timeouts)
 - Videos remain in storage based on your plan
-- Uses more proxy bandwidth than metadata extraction
+- Uses more proxy bandwidth than metadata extraction only
 
 **Example signed URL:**
 ```
@@ -102,6 +105,17 @@ Instagram requires authentication for most content. To use Instagram features:
   "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
   "useProxy": true,
   "downloadVideo": true
+}
+```
+
+### TikTok (with comments):
+```json
+{
+  "url": "https://www.tiktok.com/@username/video/1234567890",
+  "useProxy": true,
+  "downloadVideo": true,
+  "extractComments": true,
+  "maxComments": 50
 }
 ```
 
