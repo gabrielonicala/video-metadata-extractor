@@ -28,9 +28,9 @@
       "editor": "number"
     },
     "downloadVideo": {
-      "title": "Get Video Download URL",
+      "title": "Download Video",
       "type": "boolean",
-      "description": "Extract direct video URL (signed, expires after ~6 hours). Uses residential proxy for TikTok/Instagram automatically.",
+      "description": "Download the video and store it in Apify's key-value store. Returns a persistent public URL.",
       "default": false,
       "editor": "checkbox"
     }

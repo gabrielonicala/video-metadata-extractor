@@ -49,6 +49,14 @@ def parse_proxy(proxy_str: str) -> dict:
         }
     return None
 
+def resolve_proxy(use_proxy: bool = False, proxy_url: Optional[str] = None) -> Optional[str]:
+    """Resolve proxy URL - direct URL takes priority over use_proxy flag"""
+    if proxy_url:
+        return proxy_url
+    if use_proxy:
+        return get_proxy(use_scrapeops=True)
+    return None
+
 class VideoRequest(BaseModel):
     url: HttpUrl
     cookies_file: Optional[str] = Field(default=None, description="Path to cookies file for authentication")
@@ -130,6 +138,7 @@ class VideoMetadata(BaseModel):
     uploader: Optional[str] = None
     channel_id: Optional[str] = None
     channel_url: Optional[str] = None
+    channel_follower_count: Optional[int] = None
     thumbnail: Optional[str] = None
     thumbnails: Optional[List[Dict[str, Any]]] = None
     video_id: Optional[str] = None
@@ -149,19 +158,18 @@ class ExtractionResponse(BaseModel):
     timestamp: str
 
 
-def extract_twitter_metadata(url: str, use_proxy: bool = False, include_all_formats: bool = True) -> VideoMetadata:
+def extract_twitter_metadata(url: str, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
     """Extract metadata from Twitter/X using yt-dlp"""
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
     }
-    
+
     # Add proxy if requested
-    if use_proxy:
-        proxy_url = get_proxy(use_scrapeops=True)
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+    resolved = resolve_proxy(use_proxy, proxy_url)
+    if resolved:
+        ydl_opts['proxy'] = resolved
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -211,6 +219,7 @@ def extract_twitter_metadata(url: str, use_proxy: bool = False, include_all_form
             uploader=info.get('uploader'),
             channel_id=info.get('uploader_id'),
             channel_url=info.get('uploader_url'),
+            channel_follower_count=info.get('channel_follower_count'),
             thumbnail=info.get('thumbnail'),
             thumbnails=info.get('thumbnails'),
             video_id=info.get('id'),
@@ -232,7 +241,7 @@ def extract_twitter_metadata(url: str, use_proxy: bool = False, include_all_form
         )
 
 
-def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: int = 50) -> CommentsResponse:
+def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: int = 50, proxy_url: Optional[str] = None) -> CommentsResponse:
     """Extract comments from a Twitter/X post"""
     ydl_opts = {
         'quiet': True,
@@ -241,12 +250,11 @@ def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: in
         'getcomments': True,
         'max_comments': [max_comments, max_comments, max_comments, max_comments],
     }
-    
+
     # Add proxy if requested
-    if use_proxy:
-        proxy_url = get_proxy(use_scrapeops=True)
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+    resolved = resolve_proxy(use_proxy, proxy_url)
+    if resolved:
+        ydl_opts['proxy'] = resolved
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -275,13 +283,13 @@ def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: in
         )
 
 
-def extract_instagram_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True) -> VideoMetadata:
+def extract_instagram_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
     """Extract metadata from Instagram using yt-dlp with enhanced error handling"""
     import re
-    
+
     # Chrome User-Agent that matches typical browser cookie exports
     CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    
+
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -289,16 +297,15 @@ def extract_instagram_metadata(url: str, cookies_file: Optional[str] = None, use
         'user_agent': CHROME_UA,
         'referer': 'https://www.instagram.com/',
     }
-    
+
     # Instagram REQUIRES cookies for most content
     if cookies_file and os.path.exists(cookies_file):
         ydl_opts['cookiefile'] = cookies_file
-    
+
     # Add proxy if requested
-    if use_proxy:
-        proxy_url = get_proxy(use_scrapeops=True)
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+    resolved = resolve_proxy(use_proxy, proxy_url)
+    if resolved:
+        ydl_opts['proxy'] = resolved
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -350,6 +357,7 @@ def extract_instagram_metadata(url: str, cookies_file: Optional[str] = None, use
                 uploader=info.get('uploader') or info.get('creator'),
                 channel_id=info.get('uploader_id') or info.get('creator_id'),
                 channel_url=info.get('uploader_url') or info.get('creator_url'),
+                channel_follower_count=info.get('channel_follower_count'),
                 thumbnail=info.get('thumbnail'),
                 thumbnails=info.get('thumbnails'),
                 video_id=info.get('id'),
@@ -416,10 +424,10 @@ def extract_instagram_metadata(url: str, cookies_file: Optional[str] = None, use
             raise
 
 
-def extract_instagram_comments(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, max_comments: int = 50) -> CommentsResponse:
+def extract_instagram_comments(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, max_comments: int = 50, proxy_url: Optional[str] = None) -> CommentsResponse:
     """Extract comments from an Instagram post/reel with enhanced error handling"""
     CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    
+
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -429,16 +437,15 @@ def extract_instagram_comments(url: str, cookies_file: Optional[str] = None, use
         'user_agent': CHROME_UA,
         'referer': 'https://www.instagram.com/',
     }
-    
+
     # Instagram REQUIRES cookies
     if cookies_file and os.path.exists(cookies_file):
         ydl_opts['cookiefile'] = cookies_file
-    
+
     # Add proxy if requested
-    if use_proxy:
-        proxy_url = get_proxy(use_scrapeops=True)
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+    resolved = resolve_proxy(use_proxy, proxy_url)
+    if resolved:
+        ydl_opts['proxy'] = resolved
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -476,20 +483,18 @@ def extract_instagram_comments(url: str, cookies_file: Optional[str] = None, use
         raise
 
 
-def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_formats: bool = True) -> VideoMetadata:
+def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
     """Extract metadata from TikTok using yt-dlp"""
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
     }
-    
-    # Note: TikTok sometimes works better WITHOUT proxy
-    # Proxy may trigger login requirements
-    if use_proxy:
-        proxy_url = get_proxy(use_scrapeops=True)
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+
+    # Add proxy if requested
+    resolved = resolve_proxy(use_proxy, proxy_url)
+    if resolved:
+        ydl_opts['proxy'] = resolved
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -540,6 +545,7 @@ def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_forma
             uploader=info.get('uploader') or info.get('creator'),
             channel_id=info.get('uploader_id') or info.get('creator_id'),
             channel_url=info.get('uploader_url') or info.get('creator_url'),
+            channel_follower_count=info.get('channel_follower_count'),
             thumbnail=info.get('thumbnail'),
             thumbnails=info.get('thumbnails'),
             video_id=info.get('id'),
@@ -562,7 +568,7 @@ def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_forma
         )
 
 
-def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int = 100) -> CommentsResponse:
+def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int = 100, proxy_url: Optional[str] = None) -> CommentsResponse:
     """Extract comments from a TikTok video using TikTokApi
     
     Note: yt-dlp's _get_comments is not implemented for TikTok (raises NotImplementedError),
@@ -679,7 +685,7 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
         )
 
 
-def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True) -> VideoMetadata:
+def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
     """Extract metadata from YouTube using yt-dlp"""
     ydl_opts = {
         'quiet': True,
@@ -688,17 +694,18 @@ def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_p
         'writesubtitles': True,
         'writeautomaticsub': True,
     }
-    
+
     # Add proxy if requested
-    if use_proxy:
-        proxy_url = get_proxy(use_scrapeops=True)
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
-            # Use Android client when using proxy (bypasses n-challenge)
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
-    
+    resolved = resolve_proxy(use_proxy, proxy_url)
+    using_proxy = False
+    if resolved:
+        ydl_opts['proxy'] = resolved
+        using_proxy = True
+        # Use Android client when using proxy (bypasses n-challenge)
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+
     # Add cookies only if NOT using proxy (Android client doesn't support cookies)
-    if cookies_file and os.path.exists(cookies_file) and not use_proxy:
+    if cookies_file and os.path.exists(cookies_file) and not using_proxy:
         ydl_opts['cookiefile'] = cookies_file
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -754,6 +761,7 @@ def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_p
             uploader=info.get('uploader'),
             channel_id=info.get('channel_id'),
             channel_url=info.get('channel_url'),
+            channel_follower_count=info.get('channel_follower_count'),
             thumbnail=info.get('thumbnail'),
             thumbnails=info.get('thumbnails'),
             video_id=info.get('id'),
@@ -775,7 +783,7 @@ def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_p
         )
 
 
-def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: int = 100) -> CommentsResponse:
+def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: int = 100, proxy_url: Optional[str] = None) -> CommentsResponse:
     """Extract comments from a YouTube video"""
     ydl_opts = {
         'quiet': True,
@@ -784,13 +792,12 @@ def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: in
         'getcomments': True,
         'max_comments': [max_comments, max_comments, max_comments, max_comments],  # [top, newest, replies, all]
     }
-    
+
     # Add proxy if requested
-    if use_proxy:
-        proxy_url = get_proxy(use_scrapeops=True)
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+    resolved = resolve_proxy(use_proxy, proxy_url)
+    if resolved:
+        ydl_opts['proxy'] = resolved
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -1061,6 +1068,26 @@ def extract_twitter_comments_endpoint(request: TwitterCommentsRequest):
 
 
 @app.post("/extract/youtube/comments", response_model=CommentsResponse)
+def extract_youtube_comments_endpoint(request: YouTubeCommentsRequest):
+    """Extract comments from a YouTube video
+
+    Fetches actual comment text, author, likes, replies, etc.
+    Set `max_comments` to limit results (default: 100)
+    """
+    try:
+        return extract_youtube_comments(
+            str(request.url),
+            request.use_proxy,
+            request.max_comments
+        )
+    except Exception as e:
+        return CommentsResponse(
+            success=False,
+            error=str(e),
+            timestamp=datetime.utcnow().isoformat()
+        )
+
+
 class StreamRequest(BaseModel):
     url: HttpUrl
     platform: str = Field(default="youtube", description="Platform: youtube, tiktok, twitter")
@@ -1217,16 +1244,18 @@ def download_video_file(url: str, platform: str, proxy_url: Optional[str] = None
     """Download video file to memory and return content + metadata"""
     import tempfile
     import os
-    
+
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'format': 'best[ext=mp4]/best',
         'outtmpl': tempfile.gettempdir() + '/%(id)s.%(ext)s',
     }
-    
+
     if proxy_url:
         ydl_opts['proxy'] = proxy_url
+        if platform == 'youtube':
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1267,103 +1296,124 @@ async def apify_main():
     except ImportError:
         print("Apify not installed. Install with: pip install apify")
         return
-    
+
     async with Actor:
         actor_input = await Actor.get_input() or {}
         url = actor_input.get("url")
         extract_comments = actor_input.get("extractComments", False)
         download_video = actor_input.get("downloadVideo", False)
         max_comments = actor_input.get("maxComments", 50)
-        
+
         if not url:
             await Actor.fail("No URL provided. Please provide a video URL.")
             return
-        
+
         Actor.log.info(f"Processing URL: {url}")
-        
-        # Determine platform and proxy need
+
+        # Determine platform from URL
         platform = "youtube"
         url_lower = url.lower()
         if "tiktok" in url_lower:
             platform = "tiktok"
-            needs_proxy = True  # TikTok aggressively blocks
         elif "twitter" in url_lower or "x.com" in url_lower:
             platform = "twitter"
-            needs_proxy = False  # Twitter rarely blocks
         elif "instagram" in url_lower:
             platform = "instagram"
-            needs_proxy = True  # Instagram requires auth + blocks
-        else:
-            needs_proxy = False  # YouTube rarely blocks
-        
-        # Get proxy if needed
+
+        # Always use residential proxy - actor runs in datacenter
         proxy_url = None
-        if needs_proxy:
-            try:
-                proxy_configuration = await Actor.create_proxy_configuration(groups=['RESIDENTIAL'])
-                proxy_url = await proxy_configuration.new_url()
-                Actor.log.info(f"Using residential proxy for {platform}")
-            except Exception as e:
-                Actor.log.warning(f"Could not get proxy: {e}")
-        
+        try:
+            proxy_configuration = await Actor.create_proxy_configuration(groups=['RESIDENTIAL'])
+            proxy_url = await proxy_configuration.new_url()
+            Actor.log.info(f"Using Apify residential proxy for {platform}")
+        except Exception as e:
+            Actor.log.warning(f"Could not get residential proxy, trying without: {e}")
+
         try:
             Actor.log.info(f"Detected platform: {platform}")
-            
-            # Extract video metadata with proxy if needed
+
+            # Extract video metadata - pass proxy_url directly to yt-dlp
             if platform == "youtube":
-                metadata = await asyncio.to_thread(extract_youtube_metadata, url, None, needs_proxy, True)
-                result = metadata.model_dump()
-                if extract_comments:
-                    Actor.log.info("Extracting comments...")
-                    comments_resp = await asyncio.to_thread(extract_youtube_comments, url, needs_proxy, max_comments)
-                    result["comments"] = comments_resp.comments
-                    result["comments_extracted"] = len(comments_resp.comments)
-                    
+                metadata = await asyncio.to_thread(
+                    extract_youtube_metadata, url, None, False, True, proxy_url
+                )
             elif platform == "tiktok":
-                metadata = await asyncio.to_thread(extract_tiktok_metadata, url, needs_proxy, True)
-                result = metadata.model_dump()
-                if extract_comments:
-                    Actor.log.info("Extracting TikTok comments (no proxy)...")
-                    # Don't pass proxy to TikTok comments - it uses its own browser
-                    comments_resp = await asyncio.to_thread(extract_tiktok_comments, url, False, max_comments)
-                    result["comments"] = comments_resp.comments
-                    result["comments_extracted"] = len(comments_resp.comments)
-                    
+                metadata = await asyncio.to_thread(
+                    extract_tiktok_metadata, url, False, True, proxy_url
+                )
             elif platform == "twitter":
-                metadata = await asyncio.to_thread(extract_twitter_metadata, url, needs_proxy, True)
-                result = metadata.model_dump()
-                if extract_comments:
-                    Actor.log.info("Extracting comments...")
-                    comments_resp = await asyncio.to_thread(extract_twitter_comments, url, needs_proxy, max_comments)
-                    result["comments"] = comments_resp.comments
+                metadata = await asyncio.to_thread(
+                    extract_twitter_metadata, url, False, True, proxy_url
+                )
+            elif platform == "instagram":
+                metadata = await asyncio.to_thread(
+                    extract_instagram_metadata, url, None, False, True, proxy_url
+                )
+            else:
+                await Actor.fail(f"Unsupported platform for URL: {url}")
+                return
+
+            result = metadata.model_dump()
+
+            # Extract comments if requested
+            if extract_comments:
+                Actor.log.info(f"Extracting up to {max_comments} comments...")
+                try:
+                    if platform == "youtube":
+                        comments_resp = await asyncio.to_thread(
+                            extract_youtube_comments, url, False, max_comments, proxy_url
+                        )
+                    elif platform == "tiktok":
+                        # TikTok comments use browser automation, no proxy needed
+                        comments_resp = await asyncio.to_thread(
+                            extract_tiktok_comments, url, False, max_comments
+                        )
+                    elif platform == "twitter":
+                        comments_resp = await asyncio.to_thread(
+                            extract_twitter_comments, url, False, max_comments, proxy_url
+                        )
+                    elif platform == "instagram":
+                        comments_resp = await asyncio.to_thread(
+                            extract_instagram_comments, url, None, False, max_comments, proxy_url
+                        )
+
+                    # Serialize Comment objects to dicts
+                    result["comments"] = [c.model_dump() for c in comments_resp.comments]
                     result["comments_extracted"] = len(comments_resp.comments)
-            
-            # Download video if requested - actually download to key-value store
+                except Exception as e:
+                    Actor.log.warning(f"Comment extraction failed: {e}")
+                    result["comments"] = []
+                    result["comments_extracted"] = 0
+                    result["comments_error"] = str(e)
+
+            # Download video if requested - store to key-value store
             if download_video:
                 Actor.log.info("Downloading video to key-value store...")
                 try:
-                    # Download video file
-                    video_data = await asyncio.to_thread(download_video_file, url, platform, proxy_url)
+                    video_data = await asyncio.to_thread(
+                        download_video_file, url, platform, proxy_url
+                    )
                     if video_data:
-                        # Store in key-value store
                         kv_store = await Actor.open_key_value_store()
                         video_id = result.get('video_id', 'unknown')
                         ext = video_data.get('ext', 'mp4')
-                        key = f"videos/{platform}_{video_id}.{ext}"
-                        
+                        # Use underscore instead of slash to avoid URL encoding issues
+                        key = f"{platform}_{video_id}.{ext}"
+
                         await kv_store.set_value(
-                            key, 
-                            video_data['content'], 
+                            key,
+                            video_data['content'],
                             content_type=f"video/{ext}"
                         )
-                        
-                        # Get public URL
-                        public_url = f"https://api.apify.com/v2/key-value-stores/{Actor.config.default_key_value_store_id}/records/{key}"
-                        
+
+                        # Construct public URL for the stored video
+                        store_id = Actor.config.default_key_value_store_id
+                        public_url = f"https://api.apify.com/v2/key-value-stores/{store_id}/records/{key}"
+
                         result["video_key"] = key
                         result["video_url"] = public_url
                         result["video_stored"] = True
-                        result["video_size_mb"] = round(len(video_data['content']) / (1024*1024), 2)
+                        result["video_size_mb"] = round(len(video_data['content']) / (1024 * 1024), 2)
                         Actor.log.info(f"Video stored: {key} ({result['video_size_mb']} MB)")
                     else:
                         result["video_error"] = "Could not download video"
@@ -1372,17 +1422,17 @@ async def apify_main():
                     result["video_error"] = str(e)
                     result["video_stored"] = False
                     Actor.log.error(f"Video download failed: {e}")
-            
-            # Add metadata
+
+            # Add run metadata
             result["platform"] = platform
             result["extracted_at"] = datetime.utcnow().isoformat()
-            result["proxy_used"] = needs_proxy
-            
+            result["proxy_used"] = proxy_url is not None
+
             Actor.log.info(f"Successfully extracted data from {platform}")
-            
+
             # Push to dataset
             await Actor.push_data(result)
-            
+
         except Exception as e:
             Actor.log.error(f"Extraction failed: {str(e)}")
             await Actor.fail(str(e))
