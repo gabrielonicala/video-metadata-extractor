@@ -766,6 +766,8 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
     
     Note: yt-dlp's _get_comments is not implemented for TikTok (raises NotImplementedError),
     so we use TikTokApi which uses browser automation to fetch comments.
+    
+    Note: TikTokApi doesn't use the proxy since it uses browser automation.
     """
     import asyncio
     from TikTokApi import TikTokApi
@@ -776,53 +778,68 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
         video_id = None
         total_comments = None
         
-        async with TikTokApi() as api:
-            # Create session with headless browser
-            await api.create_sessions(headless=True, ms_tokens=[''], num_sessions=1)
-            
-            video = api.video(url=url)
-            
-            # Get video info for title
-            try:
-                info = await video.info()
-                video_title = info.get('desc', '')[:100] if info else None
-                video_id = info.get('id') if info else None
-                total_comments = info.get('commentCount') if info else None
-            except Exception as e:
-                print(f"Warning: Could not get video info: {e}")
-            
-            # Fetch comments
-            count = 0
-            async for comment in video.comments(count=max_comments):
-                comment_dict = comment.as_dict
-                
-                # Extract author info from nested structure
-                author = comment_dict.get('user', {}).get('nickname') or comment_dict.get('user', {}).get('uniqueId')
-                author_id = comment_dict.get('user', {}).get('uniqueId') or comment_dict.get('user', {}).get('secUid')
-                
-                # Extract other fields
-                text = comment_dict.get('text', '')
-                like_count = comment_dict.get('diggCount', 0)
-                timestamp = comment_dict.get('createTime')
-                reply_count = comment_dict.get('replyCommentTotal', 0)
-                
-                comment_obj = Comment(
-                    author=author,
-                    author_id=author_id,
-                    text=text,
-                    like_count=like_count,
-                    timestamp=timestamp,
-                    reply_count=reply_count
+        try:
+            async with TikTokApi() as api:
+                # Create session with headless browser - increased timeout
+                await api.create_sessions(
+                    headless=True, 
+                    ms_tokens=[''], 
+                    num_sessions=1,
+                    sleep_after=3  # Wait a bit after creating session
                 )
-                comments_list.append(comment_obj)
-                count += 1
                 
-                if count >= max_comments:
-                    break
+                video = api.video(url=url)
+                
+                # Get video info for title
+                try:
+                    info = await video.info()
+                    video_title = info.get('desc', '')[:100] if info else None
+                    video_id = info.get('id') if info else None
+                    total_comments = info.get('commentCount') if info else None
+                except Exception as e:
+                    print(f"Warning: Could not get video info: {e}")
+                
+                # Fetch comments with timeout handling
+                count = 0
+                try:
+                    async for comment in video.comments(count=max_comments):
+                        try:
+                            comment_dict = comment.as_dict
+                            
+                            # Extract author info from nested structure
+                            author = comment_dict.get('user', {}).get('nickname') or comment_dict.get('user', {}).get('uniqueId')
+                            author_id = comment_dict.get('user', {}).get('uniqueId') or comment_dict.get('user', {}).get('secUid')
+                            
+                            # Extract other fields
+                            text = comment_dict.get('text', '')
+                            like_count = comment_dict.get('diggCount', 0)
+                            timestamp = comment_dict.get('createTime')
+                            reply_count = comment_dict.get('replyCommentTotal', 0)
+                            
+                            comment_obj = Comment(
+                                author=author,
+                                author_id=author_id,
+                                text=text,
+                                like_count=like_count,
+                                timestamp=timestamp,
+                                reply_count=reply_count
+                            )
+                            comments_list.append(comment_obj)
+                            count += 1
+                            
+                            if count >= max_comments:
+                                break
+                        except Exception as e:
+                            print(f"Warning: Error processing comment: {e}")
+                            continue
+                except Exception as e:
+                    print(f"Warning: Error fetching comments: {e}")
+        except Exception as e:
+            print(f"Warning: TikTokApi session creation failed: {e}")
         
         return comments_list, video_title, video_id, total_comments
     
-    # Run the async function
+    # Run the async function with timeout
     try:
         comments_list, video_title, video_id, total_comments = asyncio.run(_fetch_comments())
         
@@ -832,6 +849,18 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
             video_title=video_title,
             total_comments=total_comments or len(comments_list),
             comments=comments_list,
+            timestamp=datetime.utcnow().isoformat()
+        )
+    except Exception as e:
+        # Return empty comments on error
+        print(f"Error extracting TikTok comments: {e}")
+        return CommentsResponse(
+            success=False,
+            video_id=None,
+            video_title=None,
+            total_comments=0,
+            comments=[],
+            error=str(e),
             timestamp=datetime.utcnow().isoformat()
         )
     except Exception as e:
@@ -1392,9 +1421,9 @@ async def apify_main():
                     proxy_configuration = await Actor.create_proxy_configuration(
                         groups=['RESIDENTIAL']
                     )
-                    # Get proxy URL for yt-dlp
-                    proxy_url = await proxy_configuration.new_url()
-                    Actor.log.info(f"Using Apify residential proxy: {proxy_url[:30]}...")
+                    # Get proxy URL - the url property gives us the full proxy URL
+                    proxy_url = proxy_configuration.url
+                    Actor.log.info(f"Using Apify residential proxy: {proxy_url[:50]}...")
                 except Exception as e:
                     Actor.log.warning(f"Could not create proxy configuration: {e}")
                     proxy_url = None
@@ -1409,7 +1438,7 @@ async def apify_main():
                     True,
                     proxy_url
                 )
-                result = metadata.dict()
+                result = metadata.model_dump()
                 if extract_comments:
                     Actor.log.info("Extracting comments...")
                     comments_resp = await asyncio.to_thread(
@@ -1430,7 +1459,7 @@ async def apify_main():
                     True,
                     proxy_url
                 )
-                result = metadata.dict()
+                result = metadata.model_dump()
                 if extract_comments:
                     Actor.log.info("Extracting comments...")
                     comments_resp = await asyncio.to_thread(
@@ -1451,7 +1480,7 @@ async def apify_main():
                     True,
                     proxy_url
                 )
-                result = metadata.dict()
+                result = metadata.model_dump()
                 if extract_comments:
                     Actor.log.info("Extracting comments...")
                     comments_resp = await asyncio.to_thread(
@@ -1472,7 +1501,7 @@ async def apify_main():
                     True,
                     proxy_url
                 )
-                result = metadata.dict()
+                result = metadata.model_dump()
                 if extract_comments:
                     Actor.log.info("Extracting comments...")
                     comments_resp = await asyncio.to_thread(
