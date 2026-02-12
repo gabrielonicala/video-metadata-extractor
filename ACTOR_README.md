@@ -1,14 +1,14 @@
 # Video Metadata Extractor
 
-Extract comprehensive metadata, comments, and download videos from YouTube, TikTok, Twitter/X, and Instagram videos using Apify's built-in residential proxy.
+Extract comprehensive metadata, comments, and download videos from YouTube, TikTok, Twitter/X, and Instagram videos using Apify's residential proxy.
 
 ## Features
 
 - **Multi-Platform Support**: YouTube, TikTok, Twitter/X, Instagram
 - **Video Metadata**: Title, description, views, likes, comments count, duration, uploader info
 - **Comments Extraction**: Extract actual comment text, author, likes, timestamps
-- **Video Download**: Download videos directly to Apify's key-value store
-- **Apify Residential Proxy**: Built-in proxy for reliable extraction (bypasses IP blocks)
+- **Video Download**: Download videos to Apify's key-value store (persistent, signed URLs)
+- **Apify Residential Proxy**: Built-in proxy for reliable extraction and downloads
 
 ## Input Parameters
 
@@ -18,7 +18,7 @@ Extract comprehensive metadata, comments, and download videos from YouTube, TikT
 | `extractComments` | boolean | No | false | Also extract video comments |
 | `useProxy` | boolean | No | true | Use Apify's built-in residential proxy (recommended) |
 | `maxComments` | integer | No | 50 | Maximum comments to extract (1-500) |
-| `downloadVideo` | boolean | No | false | Download the video file to Apify storage |
+| `downloadVideo` | boolean | No | false | Download video to Apify storage (max 500MB) |
 
 ## Output
 
@@ -33,34 +33,41 @@ Returns JSON with:
 - `platform` - Source platform
 - `formats` - Available video formats with direct URLs
 - `comments` - Array of comments (if requested)
-- `video_download_url` - URL to downloaded video (if downloadVideo is enabled)
-- `video_stored` - Boolean indicating if video was successfully downloaded
+- `video_download_url` - Signed URL to downloaded video (if downloadVideo enabled)
+- `video_stored` - Boolean indicating if video was successfully stored
+- `video_error` - Error message if download failed
 
 ## Platform Notes
 
 | Platform | Video | Comments | Download | Notes |
 |----------|-------|----------|----------|-------|
-| YouTube | ✅ | ✅ | ✅ | Proxy recommended |
+| YouTube | ✅ | ✅ | ✅ | Best reliability with proxy |
 | TikTok | ✅ | ✅ | ✅ | Uses browser automation for comments |
 | Twitter/X | ✅ | ✅ | ✅ | No auth required |
 | Instagram | ✅ | ✅* | ✅* | *Requires cookies for most content |
 
 ### About Apify Residential Proxy
 
-This actor uses **Apify's built-in residential proxy** (not third-party services). When `useProxy` is enabled:
+This actor uses **Apify's built-in residential proxy**. When `useProxy` is enabled:
 - Requests appear to come from real residential IPs
 - Bypasses platform IP blocks and rate limits
+- Required for reliable video downloads
 - Consumes your Apify proxy bandwidth quota
-- More reliable than datacenter IPs
 
 ### About Video Downloads
 
 When `downloadVideo` is enabled:
 - Video is downloaded using Apify's residential proxy
-- Saved to Apify's key-value store
-- Access via the returned `video_download_url`
-- Videos remain in storage for 7+ days (depending on your plan)
-- Uses more proxy bandwidth than metadata extraction only
+- Saved to Apify's key-value store with signed URLs
+- Signed URLs work from any IP and don't expire
+- Files are limited to 500MB (to prevent timeouts)
+- Videos remain in storage based on your plan
+- Uses more proxy bandwidth than metadata extraction
+
+**Example signed URL:**
+```
+https://api.apify.com/v2/key-value-stores/VeQN9U7ieYSrs0W5N/records/videos/youtube_abc123.mp4?signature=6USpGZNkFQNPdWqcTrUP
+```
 
 ### Instagram Requirements
 
@@ -101,8 +108,8 @@ Instagram requires authentication for most content. To use Instagram features:
 ## Pricing
 
 This actor uses platform credits based on extraction complexity:
-- **Video metadata only**: 1 platform credit
-- **Video + comments**: 2-5 platform credits
+- **Video metadata only**: 1-2 platform credits
+- **Video + comments**: 3-5 platform credits
 - **Video + download**: 5-15 platform credits (depends on video size)
 
 Additional costs:

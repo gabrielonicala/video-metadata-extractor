@@ -1,6 +1,6 @@
 {
   "title": "Video Metadata Extractor",
-  "description": "Extract metadata, comments, and download videos from YouTube, TikTok, Twitter/X, and Instagram",
+  "description": "Extract metadata, comments, and download videos from YouTube, TikTok, Twitter/X, and Instagram using Apify's residential proxy",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
@@ -37,7 +37,7 @@
     "downloadVideo": {
       "title": "Download Video",
       "type": "boolean",
-      "description": "Download the video file to Apify storage (consumes proxy bandwidth)",
+      "description": "Download the video file to Apify storage (max 500MB, uses proxy bandwidth)",
       "default": false,
       "editor": "checkbox"
     }

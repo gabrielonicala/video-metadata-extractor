@@ -263,25 +263,13 @@ def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: in
     
     try:
         log(f"Starting Twitter comments extraction for: {url}")
-
+        
         with sync_playwright() as p:
             # Launch browser with specific args to avoid detection
-            launch_opts = {
-                'headless': True,
-                'args': ['--disable-blink-features=AutomationControlled', '--no-sandbox']
-            }
-
-            if proxy_url:
-                from urllib.parse import urlparse
-                parsed = urlparse(proxy_url)
-                proxy_config = {'server': f'{parsed.scheme}://{parsed.hostname}:{parsed.port}'}
-                if parsed.username:
-                    proxy_config['username'] = parsed.username
-                if parsed.password:
-                    proxy_config['password'] = parsed.password
-                launch_opts['proxy'] = proxy_config
-
-            browser = p.chromium.launch(**launch_opts)
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--disable-blink-features=AutomationControlled']
+            )
             
             context = browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -331,16 +319,7 @@ def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: in
             
             # Give extra time for JavaScript to render
             time.sleep(3)
-
-            # Dismiss login modal if it appears
-            try:
-                close_btn = page.locator('[data-testid="xMigrationBottomBar"] button, [role="button"]:has-text("Not now"), button[aria-label="Close"]').first
-                if close_btn.count() > 0:
-                    close_btn.click()
-                    time.sleep(1)
-            except:
-                pass
-
+            
             # Extract tweet text
             try:
                 # Try multiple selectors for tweet text
@@ -366,29 +345,12 @@ def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: in
             
             # Scroll down to load replies
             log("Scrolling to load replies...")
-            deadline = time.time() + 30
-            prev_count = 0
-            stale_rounds = 0
-
-            for _ in range(15):
-                if time.time() > deadline:
-                    log("Hit scroll timeout")
-                    break
-                current_articles = page.locator('article').count()
-                if current_articles > max_comments + 1:  # +1 for the main tweet
-                    break
-                if current_articles == prev_count:
-                    stale_rounds += 1
-                    if stale_rounds >= 3:
-                        log("No new replies loading, stopping scroll")
-                        break
-                else:
-                    stale_rounds = 0
-                prev_count = current_articles
+            for i in range(8):  # Scroll more times
                 page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-                time.sleep(2)
-
-            time.sleep(1)
+                time.sleep(2)  # Wait for content to load
+            
+            # Give time for replies to load
+            time.sleep(3)
             
             # Extract replies
             log("Extracting replies...")
@@ -992,7 +954,7 @@ def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: in
         'getcomments': True,
         'max_comments': [max_comments, max_comments, max_comments, max_comments],  # [top, newest, replies, all]
     }
-
+    
     # Add proxy if provided or requested
     if proxy_url:
         ydl_opts['proxy'] = proxy_url
@@ -1002,13 +964,13 @@ def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: in
         if proxy:
             ydl_opts['proxy'] = proxy
             ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
-
+    
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
-
+        
         comments_list = []
         raw_comments = info.get('comments', []) or []
-
+        
         for comment_data in raw_comments[:max_comments]:
             comment = Comment(
                 author=comment_data.get('author'),
@@ -1019,7 +981,7 @@ def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: in
                 reply_count=len(comment_data.get('replies', [])) if comment_data.get('replies') else 0
             )
             comments_list.append(comment)
-
+        
         return CommentsResponse(
             success=True,
             video_id=info.get('id'),
@@ -1386,8 +1348,8 @@ def stream_video(request: StreamRequest):
 async def apify_main():
     """Main entry point for Apify Actor
     
-    Uses Apify's built-in proxy for reliable extraction.
-    Can download videos to Apify's key-value store.
+    Uses Apify's built-in residential proxy for reliable extraction.
+    Downloads videos to Apify's key-value store for persistent access.
     """
     try:
         from apify import Actor
@@ -1405,7 +1367,6 @@ async def apify_main():
         
         if not url:
             Actor.log.error("No URL provided. Please provide a video URL.")
-            return
             return
         
         Actor.log.info(f"Processing URL: {url}")
@@ -1426,15 +1387,17 @@ async def apify_main():
             # Build proxy configuration for yt-dlp
             proxy_url = None
             if use_proxy:
-                # Use Apify's built-in proxy
-                proxy_configuration = await Actor.create_proxy_configuration(
-                    groups=['RESIDENTIAL'],  # Use residential proxy
-                    country_code='US'  # Optional: specify country
-                )
-                if proxy_configuration:
-                    # Get a new proxy URL from the configuration
+                try:
+                    # Create proxy configuration
+                    proxy_configuration = await Actor.create_proxy_configuration(
+                        groups=['RESIDENTIAL']
+                    )
+                    # Get proxy URL for yt-dlp
                     proxy_url = await proxy_configuration.new_url()
-                    Actor.log.info("Using Apify residential proxy")
+                    Actor.log.info(f"Using Apify residential proxy: {proxy_url[:30]}...")
+                except Exception as e:
+                    Actor.log.warning(f"Could not create proxy configuration: {e}")
+                    proxy_url = None
             
             # Extract video metadata
             if platform == "youtube":
@@ -1442,18 +1405,19 @@ async def apify_main():
                     extract_youtube_metadata, 
                     url, 
                     None, 
-                    proxy_url is not None,  # use_proxy flag
-                    True,  # include_all_formats
-                    proxy_url  # actual proxy URL
+                    use_proxy,
+                    True,
+                    proxy_url
                 )
                 result = metadata.dict()
                 if extract_comments:
                     Actor.log.info("Extracting comments...")
                     comments_resp = await asyncio.to_thread(
-                        extract_youtube_comments,
-                        url,
+                        extract_youtube_comments, 
+                        url, 
                         use_proxy,
-                        max_comments
+                        max_comments,
+                        proxy_url
                     )
                     result["comments"] = comments_resp.comments
                     result["comments_extracted"] = len(comments_resp.comments)
@@ -1462,7 +1426,7 @@ async def apify_main():
                 metadata = await asyncio.to_thread(
                     extract_tiktok_metadata, 
                     url, 
-                    proxy_url is not None, 
+                    use_proxy, 
                     True,
                     proxy_url
                 )
@@ -1472,7 +1436,7 @@ async def apify_main():
                     comments_resp = await asyncio.to_thread(
                         extract_tiktok_comments, 
                         url, 
-                        proxy_url is not None,
+                        use_proxy,
                         max_comments,
                         proxy_url
                     )
@@ -1483,7 +1447,7 @@ async def apify_main():
                 metadata = await asyncio.to_thread(
                     extract_twitter_metadata, 
                     url, 
-                    proxy_url is not None, 
+                    use_proxy, 
                     True,
                     proxy_url
                 )
@@ -1491,11 +1455,10 @@ async def apify_main():
                 if extract_comments:
                     Actor.log.info("Extracting comments...")
                     comments_resp = await asyncio.to_thread(
-                        extract_twitter_comments,
-                        url,
-                        proxy_url is not None,
-                        max_comments,
-                        proxy_url
+                        extract_twitter_comments, 
+                        url, 
+                        use_proxy,
+                        max_comments
                     )
                     result["comments"] = comments_resp.comments
                     result["comments_extracted"] = len(comments_resp.comments)
@@ -1505,7 +1468,7 @@ async def apify_main():
                     extract_instagram_metadata, 
                     url, 
                     "instagram_cookies.txt", 
-                    proxy_url is not None, 
+                    use_proxy, 
                     True,
                     proxy_url
                 )
@@ -1516,7 +1479,7 @@ async def apify_main():
                         extract_instagram_comments, 
                         url, 
                         "instagram_cookies.txt",
-                        proxy_url is not None,
+                        use_proxy,
                         max_comments,
                         proxy_url
                     )
@@ -1525,9 +1488,9 @@ async def apify_main():
             
             # Download video if requested
             if download_video:
-                Actor.log.info("Downloading video...")
+                Actor.log.info("Downloading video to storage...")
                 try:
-                    video_url, video_error = await download_video_to_store(
+                    video_url, video_error = await download_video_to_storage(
                         url, 
                         platform, 
                         proxy_url,
@@ -1537,9 +1500,10 @@ async def apify_main():
                         result["video_download_url"] = video_url
                         result["video_stored"] = True
                         result["video_error"] = None
+                        Actor.log.info(f"Video stored: {video_url[:60]}...")
                     else:
                         result["video_stored"] = False
-                        result["video_error"] = video_error or "Unknown error during download"
+                        result["video_error"] = video_error or "Download failed"
                 except Exception as e:
                     Actor.log.error(f"Video download failed: {e}")
                     result["video_stored"] = False
@@ -1556,39 +1520,39 @@ async def apify_main():
             
         except Exception as e:
             Actor.log.error(f"Extraction failed: {str(e)}")
-            Actor.log.error(f"Extraction failed: {str(e)}")
-            raise  # Re-raise the exception to fail the actor
+            raise
 
 
-async def download_video_to_store(url: str, platform: str, proxy_url: Optional[str], Actor) -> tuple[Optional[str], Optional[str]]:
-    """Download video to Apify's key-value store
+async def download_video_to_storage(url: str, platform: str, proxy_url: Optional[str], Actor) -> tuple[Optional[str], Optional[str]]:
+    """Download video to Apify's key-value store and return signed URL
     
     Returns:
-        (public_url, error_message) - public_url is None if failed, error_message explains why
+        (signed_url, error_message) - signed_url is None if failed
     """
     import tempfile
     import os
     
+    temp_path = None
+    
     try:
         ydl_opts = {
             'quiet': True,
-            'format': 'best',
+            'format': 'best[filesize<100M]',  # Limit to 100MB to avoid timeouts
             'outtmpl': tempfile.gettempdir() + '/%(id)s.%(ext)s',
+            'socket_timeout': 30,
         }
         
         if proxy_url:
             ydl_opts['proxy'] = proxy_url
-
+            Actor.log.info(f"Using proxy for download: {proxy_url[:40]}...")
+        
         if platform == 'youtube':
-            if os.path.exists('youtube_cookies.txt'):
-                # Use web client with cookies (android client doesn't support cookies)
-                ydl_opts['cookiefile'] = 'youtube_cookies.txt'
-                ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web']}}
-            else:
-                ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
-
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+        
         if platform == 'instagram' and os.path.exists('instagram_cookies.txt'):
             ydl_opts['cookiefile'] = 'instagram_cookies.txt'
+        
+        Actor.log.info(f"Starting download for {platform} video...")
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -1599,44 +1563,55 @@ async def download_video_to_store(url: str, platform: str, proxy_url: Optional[s
             temp_path = os.path.join(tempfile.gettempdir(), f"{video_id}.{ext}")
             
             if not os.path.exists(temp_path):
-                return None, f"Download failed: file not found at {temp_path}"
+                return None, f"Download failed: file not found"
             
             # Check file size
             file_size = os.path.getsize(temp_path)
+            Actor.log.info(f"Downloaded {file_size/1024/1024:.2f} MB")
+            
             if file_size == 0:
                 os.remove(temp_path)
                 return None, "Download failed: file is empty"
             
-            Actor.log.info(f"Downloaded {file_size} bytes, uploading to storage...")
+            if file_size > 500 * 1024 * 1024:  # 500MB limit
+                os.remove(temp_path)
+                return None, "File too large (max 500MB)"
             
             # Upload to Apify's key-value store
-            key = f"{platform}_{video_id}.{ext}"
+            key = f"videos/{platform}_{video_id}.{ext}"
             
             # Read file
             with open(temp_path, 'rb') as f:
                 file_data = f.read()
             
-            # Use Actor's set_value method (simpler API)
+            Actor.log.info(f"Uploading {len(file_data)} bytes to key-value store...")
+            
+            # Store in key-value store
             await Actor.set_value(key, file_data, content_type=f'video/{ext}')
             
             # Clean up temp file
             os.remove(temp_path)
+            temp_path = None
             
-            # Build the public URL manually
-            # Format: https://api.apify.com/v2/key-value-stores/{storeId}/records/{key}
-            store_id = os.environ.get('APIFY_DEFAULT_KEY_VALUE_STORE_ID', '')
-            public_url = f"https://api.apify.com/v2/key-value-stores/{store_id}/records/{key}"
+            # Get the public URL with signature
+            # This generates a signed URL that works from any IP
+            kv_store = await Actor.open_key_value_store()
+            signed_url = kv_store.get_public_url(key)
             
-            Actor.log.info(f"Video stored successfully: {public_url}")
+            Actor.log.info(f"Video stored successfully")
             
-            return public_url, None
+            return str(signed_url), None
             
     except Exception as e:
         error_msg = str(e)
         Actor.log.error(f"Video download failed: {error_msg}")
+        # Clean up temp file on error
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except:
+                pass
         return None, error_msg
-    
-    return None, "Unknown error"
 
 
 if __name__ == "__main__":
