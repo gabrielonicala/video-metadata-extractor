@@ -792,17 +792,11 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
             # Initialize TikTokApi with custom parameters
             api = TikTokApi()
             
-            # Create session with increased timeout and better parameters
-            # Using browser_args to help avoid detection
+            # Create session with increased timeout
             await api.create_sessions(
                 headless=True,
-                ms_tokens=[''],  # Empty ms_tokens, will be generated
-                num_sessions=1,
-                browser_args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-web-security',
-                    '--disable-features=IsolateOrigins,site-per-process',
-                ]
+                ms_tokens=[''],
+                num_sessions=1
             )
             
             # Get the video object
@@ -1462,9 +1456,9 @@ async def apify_main():
                     proxy_configuration = await Actor.create_proxy_configuration(
                         groups=['RESIDENTIAL']
                     )
-                    # Get proxy URL - the url property gives us the full proxy URL
-                    proxy_url = proxy_configuration.url
-                    Actor.log.info(f"Using Apify residential proxy: {proxy_url[:50]}...")
+                    # Get proxy URL - use new_url() method to get a fresh proxy URL
+                    proxy_url = await proxy_configuration.new_url()
+                    Actor.log.info(f"Using Apify residential proxy")
                 except Exception as e:
                     Actor.log.warning(f"Could not create proxy configuration: {e}")
                     proxy_url = None
@@ -1657,28 +1651,27 @@ async def download_video_to_storage(url: str, platform: str, proxy_url: Optional
             Actor.log.info(f"Uploading {len(file_data)} bytes to key-value store...")
             
             # Store in key-value store
-            await Actor.set_value(key, file_data, content_type=f'video/{ext}')
+            try:
+                await Actor.set_value(key, file_data, content_type=f'video/{ext}')
+            except Exception as store_error:
+                Actor.log.error(f"Failed to store in key-value store: {store_error}")
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
+                return None, f"Failed to store video: {store_error}"
             
             # Clean up temp file
             os.remove(temp_path)
             temp_path = None
             
-            # Get the public URL with signature
-            # This generates a signed URL that works from any IP
+            # Construct the public URL manually
             try:
-                kv_store = await Actor.open_key_value_store()
-                signed_url = kv_store.get_public_url(key)
+                store_id = Actor.config.default_key_value_store_id
+                public_url = f"https://api.apify.com/v2/key-value-stores/{store_id}/records/{key}"
                 Actor.log.info(f"Video stored successfully")
-                return str(signed_url), None
-            except Exception as e:
-                Actor.log.warning(f"Could not get signed URL: {e}")
-                # Fallback: construct URL manually
-                try:
-                    store_id = Actor.config.default_key_value_store_id
-                    fallback_url = f"https://api.apify.com/v2/key-value-stores/{store_id}/records/{key}"
-                    return fallback_url, None
-                except:
-                    return None, f"Could not generate download URL: {e}"
+                return public_url, None
+            except Exception as url_error:
+                Actor.log.warning(f"Could not construct URL: {url_error}")
+                return None, f"Video uploaded but could not generate URL: {url_error}"
             
     except Exception as e:
         error_msg = str(e)
