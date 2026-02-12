@@ -1,13 +1,13 @@
 {
   "title": "Video Metadata Extractor",
-  "description": "Extract metadata, comments, and download videos from YouTube, TikTok, Twitter/X, and Instagram using Apify's residential proxy",
+  "description": "Extract metadata, comments, and direct video URLs from YouTube, TikTok, and Twitter/X. Automatically uses Apify's residential proxy when needed (TikTok, Instagram).",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
     "url": {
       "title": "Video URL",
       "type": "string",
-      "description": "YouTube, TikTok, Twitter/X, or Instagram video URL",
+      "description": "YouTube, TikTok, or Twitter/X video URL",
       "editor": "textfield",
       "nullable": false
     },
@@ -16,13 +16,6 @@
       "type": "boolean",
       "description": "Also extract video comments (may take longer)",
       "default": false,
-      "editor": "checkbox"
-    },
-    "useProxy": {
-      "title": "Use Apify Residential Proxy",
-      "type": "boolean",
-      "description": "Use Apify's built-in residential proxy for reliable extraction (recommended)",
-      "default": true,
       "editor": "checkbox"
     },
     "maxComments": {
@@ -35,9 +28,9 @@
       "editor": "number"
     },
     "downloadVideo": {
-      "title": "Download Video",
+      "title": "Get Video Download URL",
       "type": "boolean",
-      "description": "Download the video file to Apify storage (max 500MB, uses proxy bandwidth)",
+      "description": "Extract direct video URL (signed, expires after ~6 hours). Uses residential proxy for TikTok/Instagram automatically.",
       "default": false,
       "editor": "checkbox"
     }
