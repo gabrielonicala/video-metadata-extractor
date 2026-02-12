@@ -569,111 +569,46 @@ def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_forma
 
 
 def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int = 100, proxy_url: Optional[str] = None) -> CommentsResponse:
-    """Extract comments from a TikTok video using TikTokApi
-    
-    Note: yt-dlp's _get_comments is not implemented for TikTok (raises NotImplementedError),
-    so we use TikTokApi which uses browser automation to fetch comments.
-    """
-    import asyncio
-    from TikTokApi import TikTokApi
-    
-    async def _fetch_comments():
-        comments_list = []
-        video_title = None
-        video_id = None
-        total_comments = None
-        
-        async with TikTokApi() as api:
-            # Create session - NO proxy for TikTokApi, it uses its own browser
-            # Increased timeout by using custom browser args
-            await api.create_sessions(
-                headless=True, 
-                ms_tokens=[''], 
-                num_sessions=1,
-                sleep_after=3  # Wait 3 seconds after page load
-            )
-            
-            video = api.video(url=url)
-            
-            # Get video info for title
-            try:
-                info = await video.info()
-                video_title = info.get('desc', '')[:100] if info else None
-                video_id = info.get('id') if info else None
-                total_comments = info.get('commentCount') if info else None
-            except Exception as e:
-                print(f"Warning: Could not get video info: {e}")
-            
-            # Fetch comments with timeout protection
-            count = 0
-            try:
-                async for comment in video.comments(count=max_comments):
-                    try:
-                        comment_dict = comment.as_dict
-                        
-                        # Extract author info from nested structure
-                        author = comment_dict.get('user', {}).get('nickname') or comment_dict.get('user', {}).get('uniqueId')
-                        author_id = comment_dict.get('user', {}).get('uniqueId') or comment_dict.get('user', {}).get('secUid')
-                        
-                        # Extract other fields
-                        text = comment_dict.get('text', '')
-                        like_count = comment_dict.get('diggCount', 0)
-                        timestamp = comment_dict.get('createTime')
-                        reply_count = comment_dict.get('replyCommentTotal', 0)
-                        
-                        comment_obj = Comment(
-                            author=author,
-                            author_id=author_id,
-                            text=text,
-                            like_count=like_count,
-                            timestamp=timestamp,
-                            reply_count=reply_count
-                        )
-                        comments_list.append(comment_obj)
-                        count += 1
-                        
-                        if count >= max_comments:
-                            break
-                    except Exception as e:
-                        print(f"Warning: Error processing comment: {e}")
-                        continue
-            except Exception as e:
-                print(f"Warning: Error fetching comments: {e}")
-        
-        return comments_list, video_title, video_id, total_comments
-    
-    # Run the async function with timeout
+    """Extract comments from a TikTok video using yt-dlp"""
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'getcomments': True,
+        'max_comments': [max_comments, max_comments, max_comments, max_comments],
+    }
+
+    resolved = resolve_proxy(use_proxy, proxy_url)
+    if resolved:
+        ydl_opts['proxy'] = resolved
+
     try:
-        # Use asyncio.wait_for to add overall timeout
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # 120 second timeout for entire operation
-        comments_list, video_title, video_id, total_comments = loop.run_until_complete(
-            asyncio.wait_for(_fetch_comments(), timeout=120)
-        )
-        loop.close()
-        
-        return CommentsResponse(
-            success=True,
-            video_id=video_id,
-            video_title=video_title,
-            total_comments=total_comments or len(comments_list),
-            comments=comments_list,
-            timestamp=datetime.utcnow().isoformat()
-        )
-    except asyncio.TimeoutError:
-        return CommentsResponse(
-            success=False,
-            video_id=None,
-            video_title=None,
-            total_comments=0,
-            comments=[],
-            error="TikTok comments extraction timed out after 120 seconds. TikTok may be blocking automated access.",
-            timestamp=datetime.utcnow().isoformat()
-        )
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+            comments_list = []
+            raw_comments = info.get('comments', []) or []
+
+            for comment_data in raw_comments[:max_comments]:
+                comment = Comment(
+                    author=comment_data.get('author'),
+                    author_id=comment_data.get('author_id'),
+                    text=comment_data.get('text'),
+                    like_count=comment_data.get('like_count'),
+                    timestamp=comment_data.get('timestamp'),
+                    reply_count=len(comment_data.get('replies', [])) if comment_data.get('replies') else 0
+                )
+                comments_list.append(comment)
+
+            return CommentsResponse(
+                success=True,
+                video_id=info.get('id'),
+                video_title=info.get('title') or (info.get('description', '').split('\n')[0][:100] if info.get('description') else None),
+                total_comments=info.get('comment_count'),
+                comments=comments_list,
+                timestamp=datetime.utcnow().isoformat()
+            )
     except Exception as e:
-        # Return error response
         return CommentsResponse(
             success=False,
             video_id=None,
@@ -920,8 +855,7 @@ def extract_tiktok_comments_endpoint(request: TikTokCommentsRequest):
     Fetches actual comment text, author, likes, replies, etc.
     Set `max_comments` to limit results (default: 100)
     
-    Note: Uses TikTokApi with browser automation since yt-dlp doesn't implement
-    TikTok comment extraction (_get_comments raises NotImplementedError).
+    Uses yt-dlp to extract comments. A residential proxy is recommended.
     """
     try:
         return extract_tiktok_comments(
@@ -1364,9 +1298,8 @@ async def apify_main():
                             extract_youtube_comments, url, False, max_comments, proxy_url
                         )
                     elif platform == "tiktok":
-                        # TikTok comments use browser automation, no proxy needed
                         comments_resp = await asyncio.to_thread(
-                            extract_tiktok_comments, url, False, max_comments
+                            extract_tiktok_comments, url, False, max_comments, proxy_url
                         )
                     elif platform == "twitter":
                         comments_resp = await asyncio.to_thread(
@@ -1407,7 +1340,7 @@ async def apify_main():
                         )
 
                         # Construct public URL for the stored video
-                        store_id = Actor.config.default_key_value_store_id
+                        store_id = os.environ.get('APIFY_DEFAULT_KEY_VALUE_STORE_ID', kv_store.id)
                         public_url = f"https://api.apify.com/v2/key-value-stores/{store_id}/records/{key}"
 
                         result["video_key"] = key

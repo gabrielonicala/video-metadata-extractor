@@ -1,13 +1,10 @@
-FROM apify/actor-python-playwright:3.11
+FROM apify/actor-python:3.11
 
 # Copy requirements
 COPY requirements.txt ./
 
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Install Playwright browsers (Chromium is already installed in base image)
-RUN playwright install chromium
 
 # Copy source code
 COPY . ./
