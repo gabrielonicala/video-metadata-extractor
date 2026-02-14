@@ -950,51 +950,18 @@ def _tiktok_comments_api(video_id: str, max_comments: int, proxy_url: Optional[s
 
 
 def _youtube_extract_info(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, proxy_url: Optional[str] = None) -> dict:
-    """Try multiple YouTube player client configs, return the raw yt-dlp info dict."""
-    # Client configs to try in order (iOS first, then fallbacks)
-    client_configs = [
-        ['ios', 'web'],
-        ['tv_embedded', 'web'],
-        ['android', 'web'],
-    ]
-
-    last_error = None
-    for clients in client_configs:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': False,
-            'writesubtitles': True,
-            'writeautomaticsub': True,
-        }
-        using_proxy = apply_proxy(ydl_opts, use_proxy, proxy_url)
-        if using_proxy:
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': clients}}
-        if cookies_file and os.path.exists(cookies_file) and not using_proxy:
-            ydl_opts['cookiefile'] = cookies_file
-
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=False)
-        except Exception as e:
-            last_error = e
-
-    # Final attempt: no specific player client
+    """Extract YouTube info via yt-dlp. No player-client override — let yt-dlp defaults work."""
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
-        'writesubtitles': True,
-        'writeautomaticsub': True,
     }
     apply_proxy(ydl_opts, use_proxy, proxy_url)
     if cookies_file and os.path.exists(cookies_file):
         ydl_opts['cookiefile'] = cookies_file
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=False)
-    except Exception:
-        raise last_error
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
 
 
 def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
@@ -1082,13 +1049,11 @@ def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: in
         'max_comments': [max_comments, max_comments, max_comments, max_comments],  # [top, newest, replies, all]
     }
 
-    # Add proxy if requested
-    if apply_proxy(ydl_opts, use_proxy, proxy_url):
-        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['ios', 'web']}}
+    apply_proxy(ydl_opts, use_proxy, proxy_url)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
-        
+
         comments_list = []
         raw_comments = info.get('comments', []) or []
         
@@ -1393,9 +1358,7 @@ def stream_video_generator(url: str, platform: str, quality: str, use_proxy: boo
         proxy_url = get_proxy(use_scrapeops=True)
         if proxy_url:
             ydl_opts['proxy'] = proxy_url
-            if platform == 'youtube':
-                ydl_opts['extractor_args'] = {'youtube': {'player_client': ['ios', 'web']}}
-    
+
     # Platform-specific options
     if platform == 'instagram':
         if os.path.exists('instagram_cookies.txt'):
@@ -1617,10 +1580,8 @@ def download_video_file(url: str, platform: str, proxy_url: Optional[str] = None
         'outtmpl': tempfile.gettempdir() + '/%(id)s.%(ext)s',
     }
 
-    if apply_proxy(ydl_opts, proxy_url=proxy_url):
-        if platform == 'youtube':
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['ios', 'web']}}
-    
+    apply_proxy(ydl_opts, proxy_url=proxy_url)
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # Get info first
@@ -1717,28 +1678,36 @@ async def apify_main():
         try:
             Actor.log.info(f"Detected platform: {platform}")
 
-            # Extract video metadata - fresh proxy URL for this operation
-            proxy_url = await fresh_proxy()
-            if platform == "youtube":
-                metadata = await asyncio.to_thread(
-                    extract_youtube_metadata, url, None, False, True, proxy_url
-                )
-            elif platform == "tiktok":
-                metadata = await asyncio.to_thread(
-                    extract_tiktok_metadata, url, False, True, proxy_url
-                )
-            elif platform == "twitter":
-                metadata = await asyncio.to_thread(
-                    extract_twitter_metadata, url, False, True, proxy_url
-                )
-            elif platform == "instagram":
-                metadata = await asyncio.to_thread(
-                    extract_instagram_metadata, url, None, False, True, proxy_url
-                )
-            else:
+            # Extract video metadata with retry (proxy sessions can be flaky)
+            extractors = {
+                "youtube": lambda p: extract_youtube_metadata(url, None, False, True, p),
+                "tiktok": lambda p: extract_tiktok_metadata(url, False, True, p),
+                "twitter": lambda p: extract_twitter_metadata(url, False, True, p),
+                "instagram": lambda p: extract_instagram_metadata(url, None, False, True, p),
+            }
+
+            if platform not in extractors:
                 Actor.log.error(f"Unsupported platform for URL: {url}")
                 await Actor.fail()
                 return
+
+            metadata = None
+            last_error = None
+            # Try: residential proxy (x2 with fresh sessions), then no proxy
+            for attempt in range(3):
+                proxy_url = await fresh_proxy() if attempt < 2 else None
+                label = f"proxy session #{attempt+1}" if proxy_url else "no proxy"
+                try:
+                    Actor.log.info(f"Metadata: trying {label}...")
+                    metadata = await asyncio.to_thread(extractors[platform], proxy_url)
+                    Actor.log.info(f"Metadata extracted via {label}")
+                    break
+                except Exception as e:
+                    last_error = e
+                    Actor.log.warning(f"Metadata {label} failed: {e}")
+
+            if metadata is None:
+                raise last_error
 
             result = metadata.model_dump()
 
