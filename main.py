@@ -80,6 +80,17 @@ def apply_proxy(ydl_opts: dict, use_proxy: bool = False, proxy_url: Optional[str
         return True
     return False
 
+def _playwright_proxy_config(proxy_url: str) -> dict:
+    """Parse a proxy URL into Playwright's proxy config format."""
+    from urllib.parse import urlparse
+    parsed = urlparse(proxy_url)
+    config = {'server': f'{parsed.scheme}://{parsed.hostname}:{parsed.port}'}
+    if parsed.username:
+        config['username'] = parsed.username
+    if parsed.password:
+        config['password'] = parsed.password
+    return config
+
 class VideoRequest(BaseModel):
     url: HttpUrl
     cookies_file: Optional[str] = Field(default=None, description="Path to cookies file for authentication")
@@ -303,33 +314,141 @@ def _twitter_comments_ydl(url: str, use_proxy: bool = False, max_comments: int =
         )
 
 
+def _extract_tweets_from_graphql(data: Any, original_tweet_id: str, seen_ids: set) -> List[Comment]:
+    """Walk a Twitter GraphQL response and pull out reply tweets."""
+    comments: List[Comment] = []
+    stack = [data]
+
+    while stack:
+        obj = stack.pop()
+        if isinstance(obj, dict):
+            # Detect a Tweet node that is NOT the original tweet
+            if (obj.get('__typename') in ('Tweet', 'TweetWithVisibilityResults')
+                    and obj.get('rest_id')
+                    and str(obj.get('rest_id')) != str(original_tweet_id)
+                    and obj.get('rest_id') not in seen_ids):
+
+                seen_ids.add(obj['rest_id'])
+                legacy = obj.get('legacy', {})
+                user_legacy = (obj.get('core', {})
+                               .get('user_results', {})
+                               .get('result', {})
+                               .get('legacy', {}))
+                text = legacy.get('full_text', '')
+                if text:
+                    comments.append(Comment(
+                        author=user_legacy.get('name'),
+                        author_id=user_legacy.get('screen_name'),
+                        text=text,
+                        like_count=legacy.get('favorite_count'),
+                        timestamp=legacy.get('created_at'),
+                        reply_count=legacy.get('reply_count', 0),
+                    ))
+
+            # Also handle TweetWithVisibilityResults wrapper
+            if obj.get('__typename') == 'TweetWithVisibilityResults' and 'tweet' in obj:
+                stack.append(obj['tweet'])
+            else:
+                stack.extend(obj.values())
+        elif isinstance(obj, list):
+            stack.extend(obj)
+
+    return comments
+
+
+def _twitter_comments_playwright(tweet_url: str, tweet_id: Optional[str], max_comments: int,
+                                  proxy_url: Optional[str] = None) -> CommentsResponse:
+    """Load a tweet page in Playwright and intercept GraphQL TweetDetail responses."""
+    from playwright.sync_api import sync_playwright
+
+    all_comments: List[Comment] = []
+    seen_ids: set = set()
+
+    with sync_playwright() as p:
+        launch_kwargs: Dict[str, Any] = {'headless': True}
+        if proxy_url:
+            launch_kwargs['proxy'] = _playwright_proxy_config(proxy_url)
+
+        browser = p.chromium.launch(**launch_kwargs)
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1920, 'height': 1080},
+        )
+        page = context.new_page()
+
+        def on_response(response):
+            try:
+                if 'TweetDetail' in response.url and response.status == 200:
+                    data = response.json()
+                    new = _extract_tweets_from_graphql(data, tweet_id or '', seen_ids)
+                    all_comments.extend(new)
+            except Exception:
+                pass
+
+        page.on('response', on_response)
+
+        try:
+            page.goto(tweet_url, wait_until='domcontentloaded', timeout=60000)
+            page.wait_for_timeout(5000)
+
+            # Scroll to load more replies
+            scroll_attempts = min(10, max(1, max_comments // 10))
+            for _ in range(scroll_attempts):
+                if len(all_comments) >= max_comments:
+                    break
+                page.evaluate('window.scrollBy(0, 800)')
+                page.wait_for_timeout(2000)
+        except Exception:
+            pass
+        finally:
+            browser.close()
+
+    if not all_comments:
+        raise ValueError("Playwright could not extract Twitter comments")
+
+    return CommentsResponse(
+        success=True, video_id=tweet_id, video_title=None,
+        total_comments=len(all_comments),
+        comments=all_comments[:max_comments],
+        timestamp=datetime.utcnow().isoformat()
+    )
+
+
 def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: int = 50,
                               proxy_url: Optional[str] = None) -> CommentsResponse:
     """Extract comments from a Twitter/X post.
 
-    Tries yt-dlp. Twitter/X has heavily restricted their API, so comment
-    extraction may fail due to upstream yt-dlp issues.
+    Strategy:
+      1. Try yt-dlp (fast, may fail due to upstream bugs)
+      2. Fall back to Playwright browser (intercept GraphQL responses)
     """
     import re
 
+    errors = []
+    tweet_id = None
+    match = re.search(r'/status/(\d+)', url)
+    if match:
+        tweet_id = match.group(1)
+
+    # Try yt-dlp first
     try:
         return _twitter_comments_ydl(url, use_proxy, max_comments, proxy_url)
     except Exception as e:
-        tweet_id = None
-        match = re.search(r'/status/(\d+)', url)
-        if match:
-            tweet_id = match.group(1)
+        errors.append(f"yt-dlp: {e}")
 
-        return CommentsResponse(
-            success=False, video_id=tweet_id, video_title=None,
-            total_comments=0, comments=[],
-            error=(
-                f"Twitter/X comment extraction is currently unavailable. "
-                f"Twitter has restricted API access, and yt-dlp's comment extractor "
-                f"is broken upstream (known issue). Error: {e}"
-            ),
-            timestamp=datetime.utcnow().isoformat()
-        )
+    # Fall back to Playwright
+    try:
+        return _twitter_comments_playwright(url, tweet_id, max_comments, proxy_url)
+    except Exception as e:
+        errors.append(f"Playwright: {e}")
+
+    return CommentsResponse(
+        success=False, video_id=tweet_id, video_title=None,
+        total_comments=0, comments=[],
+        error=f"All Twitter comment strategies failed: {'; '.join(errors)}",
+        timestamp=datetime.utcnow().isoformat()
+    )
 
 
 def extract_instagram_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
@@ -608,48 +727,76 @@ def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_forma
         )
 
 
-async def _tiktok_comments_tikapi(video_id: str, max_comments: int,
-                                   video_title: Optional[str], comment_count: Optional[int],
-                                   proxy_url: Optional[str] = None) -> CommentsResponse:
-    """Fetch TikTok comments using TikTok-Api (Playwright-backed).
+def _tiktok_comments_playwright(video_url: str, video_id: str, max_comments: int,
+                                 video_title: Optional[str], comment_count: Optional[int],
+                                 proxy_url: Optional[str] = None) -> CommentsResponse:
+    """Load TikTok video page in Playwright and intercept the comments API responses."""
+    from playwright.sync_api import sync_playwright
 
-    This handles the anti-bot tokens (msToken, X-Bogus) that the direct API
-    requires but we can't generate ourselves.
-    """
-    from TikTokApi import TikTokApi
+    all_comments: List[Comment] = []
+    seen_ids: set = set()
 
-    all_comments = []
-    ms_token = os.environ.get("ms_token", None)
+    with sync_playwright() as p:
+        launch_kwargs: Dict[str, Any] = {'headless': True}
+        if proxy_url:
+            launch_kwargs['proxy'] = _playwright_proxy_config(proxy_url)
 
-    session_kwargs = {
-        "ms_tokens": [ms_token],
-        "num_sessions": 1,
-        "sleep_after": 3,
-        "browser": os.environ.get("TIKTOK_BROWSER", "chromium"),
-    }
-    if proxy_url:
-        session_kwargs["proxies"] = [proxy_url]
+        browser = p.chromium.launch(**launch_kwargs)
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1920, 'height': 1080},
+        )
+        page = context.new_page()
 
-    async with TikTokApi() as api:
-        await api.create_sessions(**session_kwargs)
-        video = api.video(id=int(video_id))
-        async for comment in video.comments(count=max_comments):
-            d = comment.as_dict if hasattr(comment, 'as_dict') else {}
-            if isinstance(d, dict) and d:
-                user = d.get('user', {})
-                all_comments.append(Comment(
-                    author=user.get('nickname'),
-                    author_id=user.get('unique_id') or user.get('uniqueId'),
-                    text=d.get('text'),
-                    like_count=d.get('digg_count') or d.get('diggCount'),
-                    timestamp=d.get('create_time') or d.get('createTime'),
-                    reply_count=d.get('reply_comment_total') or d.get('replyCommentTotal', 0),
-                ))
-            if len(all_comments) >= max_comments:
-                break
+        def on_response(response):
+            try:
+                if '/api/comment/list' in response.url and response.status == 200:
+                    data = response.json()
+                    for c in (data.get('comments') or []):
+                        cid = str(c.get('cid', ''))
+                        if cid and cid in seen_ids:
+                            continue
+                        if cid:
+                            seen_ids.add(cid)
+                        user = c.get('user', {})
+                        all_comments.append(Comment(
+                            author=user.get('nickname'),
+                            author_id=user.get('unique_id'),
+                            text=c.get('text'),
+                            like_count=c.get('digg_count'),
+                            timestamp=c.get('create_time'),
+                            reply_count=c.get('reply_comment_total', 0),
+                        ))
+            except Exception:
+                pass
+
+        page.on('response', on_response)
+
+        try:
+            page.goto(video_url, wait_until='domcontentloaded', timeout=60000)
+            page.wait_for_timeout(5000)
+
+            # Scroll to load more comments (TikTok loads ~20 per batch)
+            scroll_attempts = min(10, max(1, max_comments // 20))
+            for _ in range(scroll_attempts):
+                if len(all_comments) >= max_comments:
+                    break
+                # Try scrolling the comments panel, fall back to page scroll
+                page.evaluate("""
+                    const panel = document.querySelector('[class*="CommentListContainer"]')
+                                || document.querySelector('[class*="DivCommentListContainer"]');
+                    if (panel) { panel.scrollTop = panel.scrollHeight; }
+                    else { window.scrollBy(0, 600); }
+                """)
+                page.wait_for_timeout(2000)
+        except Exception:
+            pass
+        finally:
+            browser.close()
 
     if not all_comments:
-        raise ValueError("TikTok-Api returned no comments")
+        raise ValueError("Playwright could not extract TikTok comments")
 
     return CommentsResponse(
         success=True, video_id=video_id, video_title=video_title,
@@ -702,25 +849,14 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
     except Exception as e:
         errors.append(f"Direct API: {e}")
 
-    # Step 3: fall back to TikTok-Api (Playwright-backed, async)
-    try:
-        import asyncio as _aio
+    # Step 3: fall back to Playwright browser (intercept API responses)
+    if proxy_url:
         try:
-            loop = _aio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            # Already inside an event loop (Apify actor) — run in a new thread
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(_aio.run, _tiktok_comments_tikapi(video_id, max_comments, video_title, comment_count, proxy_url))
-                result = future.result(timeout=120)
-            return result
-        else:
-            return _aio.run(_tiktok_comments_tikapi(video_id, max_comments, video_title, comment_count, proxy_url))
-    except Exception as e:
-        errors.append(f"TikTok-Api: {e}")
+            return _tiktok_comments_playwright(url, video_id, max_comments, video_title, comment_count, proxy_url)
+        except Exception as e:
+            errors.append(f"Playwright: {e}")
+    else:
+        errors.append("Playwright: skipped (needs proxy to reach TikTok from datacenter)")
 
     return CommentsResponse(
         success=False, video_id=video_id, video_title=video_title,

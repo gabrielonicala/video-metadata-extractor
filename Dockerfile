@@ -6,9 +6,6 @@ COPY requirements.txt ./
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright Chromium for TikTok-Api
-RUN playwright install chromium
-
 # Copy source code
 COPY . ./
 
