@@ -369,7 +369,10 @@ def _twitter_comments_playwright(tweet_url: str, tweet_id: Optional[str], max_co
     log.info(f"Launching Playwright for Twitter (proxy={'yes' if proxy_url else 'no'})...")
 
     with sync_playwright() as p:
-        launch_kwargs: Dict[str, Any] = {'headless': True}
+        launch_kwargs: Dict[str, Any] = {
+            'headless': True,
+            'args': ['--disable-blink-features=AutomationControlled', '--no-sandbox'],
+        }
         if proxy_url:
             launch_kwargs['proxy'] = _playwright_proxy_config(proxy_url)
 
@@ -378,7 +381,9 @@ def _twitter_comments_playwright(tweet_url: str, tweet_id: Optional[str], max_co
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                        '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             viewport={'width': 1920, 'height': 1080},
+            locale='en-US',
         )
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = context.new_page()
 
         def on_response(response):
@@ -399,18 +404,39 @@ def _twitter_comments_playwright(tweet_url: str, tweet_id: Optional[str], max_co
         try:
             log.info(f"Navigating to {tweet_url}...")
             page.goto(tweet_url, wait_until='domcontentloaded', timeout=60000)
-            log.info(f"Page loaded. Title: {page.title()}")
-            page.wait_for_timeout(8000)
+            title = page.title()
+            log.info(f"Page loaded. Title: {title}")
+
+            # Detect login wall — Twitter/X redirects to login or shows a modal
+            current_url = page.url
+            if '/login' in current_url or '/i/flow/login' in current_url:
+                log.warning("Twitter redirected to login page — auth required for replies")
+                raise ValueError("Twitter requires login to view replies (redirected to login page)")
+
+            # Wait for tweet content to render
+            try:
+                page.wait_for_selector('article[data-testid="tweet"]', timeout=15000)
+                log.info("Tweet article found on page")
+            except Exception:
+                log.info("Tweet article not found after 15s")
+                # Check for login modal overlay
+                login_modal = page.query_selector('[data-testid="loginButton"], [href="/login"]')
+                if login_modal:
+                    raise ValueError("Twitter shows login prompt — auth required for replies")
+
+            page.wait_for_timeout(5000)
             log.info(f"After initial wait: {len(all_comments)} comments captured")
 
             # Scroll to load more replies
-            scroll_attempts = min(10, max(1, max_comments // 10))
+            scroll_attempts = min(12, max(2, max_comments // 8))
             for i in range(scroll_attempts):
                 if len(all_comments) >= max_comments:
                     break
                 page.evaluate('window.scrollBy(0, 800)')
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(2500)
             log.info(f"After scrolling: {len(all_comments)} comments total")
+        except ValueError:
+            raise
         except Exception as e:
             log.warning(f"Page interaction error: {e}")
         finally:
@@ -739,11 +765,44 @@ def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_forma
         )
 
 
+def _extract_comments_from_tiktok_data(data: Any, comments_list: List[Comment], seen_ids: set):
+    """Extract comments from TikTok's embedded page data (__UNIVERSAL_DATA_FOR_REHYDRATION__ or SIGI_STATE)."""
+    stack = [data]
+    while stack:
+        obj = stack.pop()
+        if isinstance(obj, dict):
+            if 'comments' in obj and isinstance(obj['comments'], list):
+                for c in obj['comments']:
+                    if not isinstance(c, dict):
+                        continue
+                    cid = str(c.get('cid', c.get('id', '')))
+                    if cid in seen_ids:
+                        continue
+                    if cid:
+                        seen_ids.add(cid)
+                    user = c.get('user', {})
+                    text = c.get('text', '')
+                    if text:
+                        comments_list.append(Comment(
+                            author=user.get('nickname'),
+                            author_id=user.get('unique_id') or user.get('uniqueId'),
+                            text=text,
+                            like_count=c.get('digg_count') or c.get('diggCount'),
+                            timestamp=c.get('create_time') or c.get('createTime'),
+                            reply_count=c.get('reply_comment_total') or c.get('replyCommentTotal', 0),
+                        ))
+            else:
+                stack.extend(obj.values())
+        elif isinstance(obj, list):
+            stack.extend(obj)
+
+
 def _tiktok_comments_playwright(video_url: str, video_id: str, max_comments: int,
                                  video_title: Optional[str], comment_count: Optional[int],
                                  proxy_url: Optional[str] = None) -> CommentsResponse:
     """Load TikTok video page in Playwright and intercept the comments API responses."""
     import logging
+    import json
     log = logging.getLogger('playwright.tiktok')
     from playwright.sync_api import sync_playwright
 
@@ -753,7 +812,10 @@ def _tiktok_comments_playwright(video_url: str, video_id: str, max_comments: int
     log.info(f"Launching Playwright for TikTok (proxy={'yes' if proxy_url else 'no'})...")
 
     with sync_playwright() as p:
-        launch_kwargs: Dict[str, Any] = {'headless': True}
+        launch_kwargs: Dict[str, Any] = {
+            'headless': True,
+            'args': ['--disable-blink-features=AutomationControlled', '--no-sandbox'],
+        }
         if proxy_url:
             launch_kwargs['proxy'] = _playwright_proxy_config(proxy_url)
 
@@ -762,7 +824,9 @@ def _tiktok_comments_playwright(video_url: str, video_id: str, max_comments: int
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                        '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             viewport={'width': 1920, 'height': 1080},
+            locale='en-US',
         )
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = context.new_page()
 
         def on_response(response):
@@ -797,23 +861,65 @@ def _tiktok_comments_playwright(video_url: str, video_id: str, max_comments: int
         try:
             log.info(f"Navigating to {video_url}...")
             page.goto(video_url, wait_until='domcontentloaded', timeout=60000)
-            log.info(f"Page loaded. Title: {page.title()}")
-            page.wait_for_timeout(8000)
+            title = page.title()
+            log.info(f"Page loaded. Title: {title}")
+
+            # CAPTCHA / verification detection
+            if any(kw in title.lower() for kw in ['verify', 'captcha', 'robot', 'check']):
+                log.warning(f"Verification page detected: {title}")
+                raise ValueError(f"TikTok verification page detected: {title}")
+
+            # Wait for the comment section to render (better than fixed sleep)
+            try:
+                page.wait_for_selector(
+                    '[data-e2e="comment-list"], [class*="CommentListContainer"], '
+                    '[class*="DivCommentListContainer"], [class*="comment-item"]',
+                    timeout=15000,
+                )
+                log.info("Comment section found on page")
+            except Exception:
+                log.info("Comment section not found after 15s, continuing anyway...")
+
+            page.wait_for_timeout(3000)
             log.info(f"After initial wait: {len(all_comments)} comments captured")
 
-            # Scroll to load more comments (TikTok loads ~20 per batch)
-            scroll_attempts = min(10, max(1, max_comments // 20))
+            # If no comments from API intercept, try embedded page data
+            if not all_comments:
+                log.info("No API intercepts, trying embedded page data...")
+                try:
+                    page_data = page.evaluate("""() => {
+                        const el = document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
+                        if (el) return el.textContent;
+                        const sigi = document.getElementById('SIGI_STATE');
+                        if (sigi) return sigi.textContent;
+                        return null;
+                    }""")
+                    if page_data:
+                        data = json.loads(page_data)
+                        _extract_comments_from_tiktok_data(data, all_comments, seen_ids)
+                        if all_comments:
+                            log.info(f"Extracted {len(all_comments)} comments from page data")
+                        else:
+                            log.info("No comments found in embedded page data")
+                except Exception as e:
+                    log.debug(f"Page data extraction failed: {e}")
+
+            # Scroll to load more comment batches
+            scroll_attempts = min(15, max(2, max_comments // 15))
             for i in range(scroll_attempts):
                 if len(all_comments) >= max_comments:
                     break
                 page.evaluate("""
-                    const panel = document.querySelector('[class*="CommentListContainer"]')
+                    const panel = document.querySelector('[data-e2e="comment-list"]')
+                                || document.querySelector('[class*="CommentListContainer"]')
                                 || document.querySelector('[class*="DivCommentListContainer"]');
                     if (panel) { panel.scrollTop = panel.scrollHeight; }
-                    else { window.scrollBy(0, 600); }
+                    else { window.scrollBy(0, 800); }
                 """)
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(2500)
             log.info(f"After scrolling: {len(all_comments)} comments total")
+        except ValueError:
+            raise
         except Exception as e:
             log.warning(f"Page interaction error: {e}")
         finally:
