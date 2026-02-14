@@ -49,6 +49,19 @@ def parse_proxy(proxy_str: str) -> dict:
         }
     return None
 
+def _get_follower_count(info: dict) -> Optional[int]:
+    """Extract follower/subscriber count from yt-dlp info dict.
+
+    Tries multiple field names since different platforms use different keys.
+    Uses explicit None checks so a valid 0 value isn't skipped.
+    """
+    for key in ('channel_follower_count', 'uploader_follower_count', 'follower_count'):
+        val = info.get(key)
+        if val is not None:
+            return val
+    return None
+
+
 def resolve_proxy(use_proxy: bool = False, proxy_url: Optional[str] = None) -> Optional[str]:
     """Resolve proxy URL - direct URL takes priority over use_proxy flag"""
     if proxy_url:
@@ -226,7 +239,7 @@ def extract_twitter_metadata(url: str, use_proxy: bool = False, include_all_form
             uploader=info.get('uploader'),
             channel_id=info.get('uploader_id'),
             channel_url=info.get('uploader_url'),
-            followers=info.get('channel_follower_count') or info.get('uploader_follower_count') or info.get('follower_count'),
+            followers=_get_follower_count(info),
             thumbnail=info.get('thumbnail'),
             thumbnails=info.get('thumbnails'),
             video_id=info.get('id'),
@@ -390,7 +403,7 @@ def extract_instagram_metadata(url: str, cookies_file: Optional[str] = None, use
                 uploader=info.get('uploader') or info.get('creator'),
                 channel_id=info.get('uploader_id') or info.get('creator_id'),
                 channel_url=info.get('uploader_url') or info.get('creator_url'),
-                followers=info.get('channel_follower_count') or info.get('uploader_follower_count') or info.get('follower_count'),
+                followers=_get_follower_count(info),
                 thumbnail=info.get('thumbnail'),
                 thumbnails=info.get('thumbnails'),
                 video_id=info.get('id'),
@@ -572,7 +585,7 @@ def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_forma
             uploader=info.get('uploader') or info.get('creator'),
             channel_id=info.get('uploader_id') or info.get('creator_id'),
             channel_url=info.get('uploader_url') or info.get('creator_url'),
-            followers=info.get('channel_follower_count') or info.get('uploader_follower_count') or info.get('follower_count'),
+            followers=_get_follower_count(info),
             thumbnail=info.get('thumbnail'),
             thumbnails=info.get('thumbnails'),
             video_id=info.get('id'),
@@ -596,7 +609,8 @@ def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_forma
 
 
 async def _tiktok_comments_tikapi(video_id: str, max_comments: int,
-                                   video_title: Optional[str], comment_count: Optional[int]) -> CommentsResponse:
+                                   video_title: Optional[str], comment_count: Optional[int],
+                                   proxy_url: Optional[str] = None) -> CommentsResponse:
     """Fetch TikTok comments using TikTok-Api (Playwright-backed).
 
     This handles the anti-bot tokens (msToken, X-Bogus) that the direct API
@@ -607,13 +621,17 @@ async def _tiktok_comments_tikapi(video_id: str, max_comments: int,
     all_comments = []
     ms_token = os.environ.get("ms_token", None)
 
+    session_kwargs = {
+        "ms_tokens": [ms_token],
+        "num_sessions": 1,
+        "sleep_after": 3,
+        "browser": os.environ.get("TIKTOK_BROWSER", "chromium"),
+    }
+    if proxy_url:
+        session_kwargs["proxies"] = [proxy_url]
+
     async with TikTokApi() as api:
-        await api.create_sessions(
-            ms_tokens=[ms_token],
-            num_sessions=1,
-            sleep_after=3,
-            browser=os.environ.get("TIKTOK_BROWSER", "chromium"),
-        )
+        await api.create_sessions(**session_kwargs)
         video = api.video(id=int(video_id))
         async for comment in video.comments(count=max_comments):
             d = comment.as_dict if hasattr(comment, 'as_dict') else {}
@@ -696,11 +714,11 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
             # Already inside an event loop (Apify actor) — run in a new thread
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(_aio.run, _tiktok_comments_tikapi(video_id, max_comments, video_title, comment_count))
+                future = pool.submit(_aio.run, _tiktok_comments_tikapi(video_id, max_comments, video_title, comment_count, proxy_url))
                 result = future.result(timeout=120)
             return result
         else:
-            return _aio.run(_tiktok_comments_tikapi(video_id, max_comments, video_title, comment_count))
+            return _aio.run(_tiktok_comments_tikapi(video_id, max_comments, video_title, comment_count, proxy_url))
     except Exception as e:
         errors.append(f"TikTok-Api: {e}")
 
@@ -844,7 +862,7 @@ def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_p
             uploader=info.get('uploader'),
             channel_id=info.get('channel_id'),
             channel_url=info.get('channel_url'),
-            followers=info.get('channel_follower_count') or info.get('uploader_follower_count') or info.get('follower_count'),
+            followers=_get_follower_count(info),
             thumbnail=info.get('thumbnail'),
             thumbnails=info.get('thumbnails'),
             video_id=info.get('id'),
