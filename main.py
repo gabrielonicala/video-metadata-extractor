@@ -87,6 +87,7 @@ class TwitterCommentsRequest(BaseModel):
     url: HttpUrl
     use_proxy: Optional[bool] = Field(default=False, description="Use proxy for extraction")
     max_comments: Optional[int] = Field(default=50, description="Maximum number of comments to fetch (default: 50)")
+    cookies_content: Optional[str] = Field(default=None, description="Netscape cookies.txt content for Twitter auth (needed for comment extraction fallback)")
 
 
 class InstagramRequest(BaseModel):
@@ -248,8 +249,8 @@ def extract_twitter_metadata(url: str, use_proxy: bool = False, include_all_form
         )
 
 
-def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: int = 50, proxy_url: Optional[str] = None) -> CommentsResponse:
-    """Extract comments from a Twitter/X post"""
+def _twitter_comments_ydl(url: str, use_proxy: bool = False, max_comments: int = 50, proxy_url: Optional[str] = None) -> CommentsResponse:
+    """Extract Twitter comments via yt-dlp (may fail due to upstream bugs)."""
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -277,6 +278,9 @@ def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: in
             )
             comments_list.append(comment)
 
+        if not comments_list:
+            raise ValueError("yt-dlp returned no Twitter comments")
+
         return CommentsResponse(
             success=True,
             video_id=info.get('id'),
@@ -285,6 +289,119 @@ def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: in
             comments=comments_list,
             timestamp=datetime.utcnow().isoformat()
         )
+
+
+def _twitter_comments_twscrape(tweet_id: str, max_comments: int, cookies_content: Optional[str] = None) -> CommentsResponse:
+    """Fetch Twitter/X replies using twscrape.
+
+    Requires either:
+    - cookies_content: raw Netscape cookies.txt content for Twitter session
+    - Or returns a clear error explaining authentication is needed
+    """
+    import asyncio as _asyncio
+    from twscrape import API as TwAPI, gather
+
+    async def _fetch():
+        api = TwAPI()
+
+        if cookies_content:
+            # Write cookies to a temp file for twscrape
+            import tempfile
+            cookies_path = os.path.join(tempfile.gettempdir(), 'twitter_cookies.txt')
+            with open(cookies_path, 'w') as f:
+                f.write(cookies_content)
+            try:
+                await api.pool.add_account("cookies_user", "", "", "", cookies=cookies_path)
+                await api.pool.login_all()
+            except Exception as e:
+                raise ValueError(f"Failed to authenticate with Twitter cookies: {e}")
+        else:
+            raise ValueError(
+                "Twitter comment extraction requires authentication. "
+                "Provide 'twitterCookies' (Netscape cookies.txt content) in the actor input. "
+                "Export cookies from your browser after logging into Twitter/X."
+            )
+
+        comments = []
+        try:
+            async for tweet in api.replies(int(tweet_id), limit=max_comments):
+                comments.append(Comment(
+                    author=tweet.user.displayname if tweet.user else None,
+                    author_id=tweet.user.username if tweet.user else None,
+                    text=tweet.rawContent,
+                    like_count=tweet.likeCount,
+                    timestamp=int(tweet.date.timestamp()) if tweet.date else None,
+                    reply_count=tweet.replyCount,
+                ))
+                if len(comments) >= max_comments:
+                    break
+        except Exception as e:
+            if not comments:
+                raise ValueError(f"twscrape replies failed: {e}")
+
+        if not comments:
+            raise ValueError("twscrape returned no replies")
+
+        return CommentsResponse(
+            success=True, video_id=tweet_id, video_title=None,
+            total_comments=len(comments), comments=comments,
+            timestamp=datetime.utcnow().isoformat()
+        )
+
+    # Run the async function
+    try:
+        loop = _asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # We're inside an event loop (e.g. Apify actor) — use a new thread
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(_asyncio.run, _fetch())
+            return future.result(timeout=120)
+    else:
+        return _asyncio.run(_fetch())
+
+
+def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: int = 50,
+                              proxy_url: Optional[str] = None, cookies_content: Optional[str] = None) -> CommentsResponse:
+    """Extract comments from a Twitter/X post.
+
+    Strategy:
+      1. Try yt-dlp (no auth needed, but may fail with upstream bugs)
+      2. Fall back to twscrape (requires Twitter cookies for auth)
+    """
+    import re
+
+    errors = []
+
+    # Try yt-dlp first
+    try:
+        return _twitter_comments_ydl(url, use_proxy, max_comments, proxy_url)
+    except Exception as e:
+        errors.append(f"yt-dlp: {e}")
+
+    # Extract tweet ID for twscrape
+    tweet_id = None
+    match = re.search(r'/status/(\d+)', url)
+    if match:
+        tweet_id = match.group(1)
+
+    if tweet_id:
+        try:
+            return _twitter_comments_twscrape(tweet_id, max_comments, cookies_content)
+        except Exception as e:
+            errors.append(f"twscrape: {e}")
+    else:
+        errors.append("Could not extract tweet ID from URL for twscrape fallback")
+
+    return CommentsResponse(
+        success=False, video_id=tweet_id, video_title=None,
+        total_comments=0, comments=[],
+        error=f"All Twitter comment strategies failed: {'; '.join(errors)}",
+        timestamp=datetime.utcnow().isoformat()
+    )
 
 
 def extract_instagram_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
@@ -563,54 +680,169 @@ def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_forma
         )
 
 
-def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int = 100, proxy_url: Optional[str] = None) -> CommentsResponse:
-    """Extract comments from a TikTok video using yt-dlp"""
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': False,
-        'getcomments': True,
-        'max_comments': [max_comments, max_comments, max_comments, max_comments],
-    }
+def _tiktok_comments_tikapi(video_id: str, max_comments: int,
+                             video_title: Optional[str], comment_count: Optional[int]) -> CommentsResponse:
+    """Fetch TikTok comments using TikTok-Api (Playwright-backed).
 
+    This handles the anti-bot tokens (msToken, X-Bogus) that the direct API
+    requires but we can't generate ourselves.
+    """
+    from TikTokApi import TikTokApi
+
+    all_comments = []
+
+    with TikTokApi() as api:
+        video = api.video(id=video_id)
+        for comment in video.comments(count=max_comments):
+            comment_dict = comment.as_dict if hasattr(comment, 'as_dict') else comment
+            if isinstance(comment_dict, dict):
+                user = comment_dict.get('user', {})
+                all_comments.append(Comment(
+                    author=user.get('nickname'),
+                    author_id=user.get('unique_id') or user.get('uniqueId'),
+                    text=comment_dict.get('text'),
+                    like_count=comment_dict.get('digg_count') or comment_dict.get('diggCount'),
+                    timestamp=comment_dict.get('create_time') or comment_dict.get('createTime'),
+                    reply_count=comment_dict.get('reply_comment_total') or comment_dict.get('replyCommentTotal', 0),
+                ))
+            else:
+                # comment object with attributes
+                all_comments.append(Comment(
+                    author=getattr(comment, 'author', {}).get('nickname') if isinstance(getattr(comment, 'author', None), dict) else None,
+                    author_id=getattr(comment, 'author', {}).get('unique_id') if isinstance(getattr(comment, 'author', None), dict) else None,
+                    text=getattr(comment, 'text', None),
+                    like_count=getattr(comment, 'likes_count', None),
+                    timestamp=getattr(comment, 'create_time', None),
+                    reply_count=getattr(comment, 'reply_comment_total', 0),
+                ))
+            if len(all_comments) >= max_comments:
+                break
+
+    if not all_comments:
+        raise ValueError("TikTok-Api returned no comments")
+
+    return CommentsResponse(
+        success=True, video_id=video_id, video_title=video_title,
+        total_comments=comment_count or len(all_comments),
+        comments=all_comments[:max_comments],
+        timestamp=datetime.utcnow().isoformat()
+    )
+
+
+def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int = 100, proxy_url: Optional[str] = None) -> CommentsResponse:
+    """Extract comments from a TikTok video.
+
+    Strategy:
+      1. Try the lightweight direct API (no browser needed)
+      2. Fall back to TikTok-Api (Playwright) if the direct API fails
+    """
+    import re
+
+    video_id = None
+    video_title = None
+    comment_count = None
+
+    # Step 1: get video ID and metadata via yt-dlp
+    ydl_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': False}
     apply_proxy(ydl_opts, use_proxy, proxy_url)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+            video_id = info.get('id')
+            video_title = info.get('title') or (info.get('description', '').split('\n')[0][:100] if info.get('description') else None)
+            comment_count = info.get('comment_count')
+    except Exception:
+        # Try to extract video ID from URL as fallback
+        match = re.search(r'/video/(\d+)', url)
+        if match:
+            video_id = match.group(1)
 
-            comments_list = []
-            raw_comments = info.get('comments', []) or []
-
-            for comment_data in raw_comments[:max_comments]:
-                comment = Comment(
-                    author=comment_data.get('author'),
-                    author_id=comment_data.get('author_id'),
-                    text=comment_data.get('text'),
-                    like_count=comment_data.get('like_count'),
-                    timestamp=comment_data.get('timestamp'),
-                    reply_count=len(comment_data.get('replies', [])) if comment_data.get('replies') else 0
-                )
-                comments_list.append(comment)
-
-            return CommentsResponse(
-                success=True,
-                video_id=info.get('id'),
-                video_title=info.get('title') or (info.get('description', '').split('\n')[0][:100] if info.get('description') else None),
-                total_comments=info.get('comment_count'),
-                comments=comments_list,
-                timestamp=datetime.utcnow().isoformat()
-            )
-    except Exception as e:
+    if not video_id:
         return CommentsResponse(
-            success=False,
-            video_id=None,
-            video_title=None,
-            total_comments=0,
-            comments=[],
-            error=f"TikTok comments extraction failed: {str(e)}",
+            success=False, video_id=None, video_title=None, total_comments=0,
+            comments=[], error="Could not determine TikTok video ID",
             timestamp=datetime.utcnow().isoformat()
         )
+
+    # Step 2: try direct API first (lightweight)
+    errors = []
+    try:
+        return _tiktok_comments_api(video_id, max_comments, proxy_url, video_title, comment_count)
+    except Exception as e:
+        errors.append(f"Direct API: {e}")
+
+    # Step 3: fall back to TikTok-Api (Playwright-backed)
+    try:
+        return _tiktok_comments_tikapi(video_id, max_comments, video_title, comment_count)
+    except Exception as e:
+        errors.append(f"TikTok-Api: {e}")
+
+    return CommentsResponse(
+        success=False, video_id=video_id, video_title=video_title,
+        total_comments=comment_count or 0, comments=[],
+        error=f"All TikTok comment strategies failed: {'; '.join(errors)}",
+        timestamp=datetime.utcnow().isoformat()
+    )
+
+
+def _tiktok_comments_api(video_id: str, max_comments: int, proxy_url: Optional[str],
+                          video_title: Optional[str], comment_count: Optional[int]) -> CommentsResponse:
+    """Fetch TikTok comments via direct API call."""
+    api_url = "https://www.tiktok.com/api/comment/list/"
+    all_comments = []
+    cursor = 0
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://www.tiktok.com/',
+        'Accept': 'application/json, text/plain, */*',
+    }
+
+    proxies = None
+    if proxy_url:
+        proxies = {'http': proxy_url, 'https': proxy_url}
+
+    while len(all_comments) < max_comments:
+        params = {
+            'aweme_id': video_id,
+            'count': min(50, max_comments - len(all_comments)),
+            'cursor': cursor,
+        }
+
+        resp = requests.get(api_url, params=params, headers=headers, proxies=proxies, timeout=30)
+        if resp.status_code != 200:
+            break
+
+        data = resp.json()
+        comments_data = data.get('comments')
+        if not comments_data:
+            break
+
+        for c in comments_data:
+            user = c.get('user', {})
+            all_comments.append(Comment(
+                author=user.get('nickname'),
+                author_id=user.get('unique_id'),
+                text=c.get('text'),
+                like_count=c.get('digg_count'),
+                timestamp=c.get('create_time'),
+                reply_count=c.get('reply_comment_total', 0),
+            ))
+
+        if not data.get('has_more'):
+            break
+        cursor = data.get('cursor', cursor + len(comments_data))
+
+    if not all_comments:
+        raise ValueError("TikTok API returned no comments (may require authentication)")
+
+    return CommentsResponse(
+        success=True, video_id=video_id, video_title=video_title,
+        total_comments=comment_count or len(all_comments),
+        comments=all_comments[:max_comments],
+        timestamp=datetime.utcnow().isoformat()
+    )
 
 
 def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
@@ -979,7 +1211,8 @@ def extract_twitter_comments_endpoint(request: TwitterCommentsRequest):
         return extract_twitter_comments(
             str(request.url),
             request.use_proxy,
-            request.max_comments
+            request.max_comments,
+            cookies_content=request.cookies_content
         )
     except Exception as e:
         return CommentsResponse(
@@ -1162,7 +1395,85 @@ def get_best_video_url(url: str, platform: str, proxy_url: Optional[str] = None)
     return None
 
 
-def download_video_file(url: str, platform: str, proxy_url: Optional[str] = None) -> Optional[Dict]:
+def select_format_url(formats: list, quality: str = "best") -> Optional[Dict[str, Any]]:
+    """Select the best matching format from the metadata formats list.
+
+    Prefers combined (video+audio) formats, but falls back to video-only
+    formats when combined ones don't meet the requested quality (e.g. Android
+    client caps combined MP4 at 360p while video-only streams go to 1080p+).
+
+    Returns dict with 'url', 'height', 'ext', 'has_audio', etc. or None.
+    """
+    if not formats:
+        return None
+
+    combined = [f for f in formats if f.get('has_video') and f.get('has_audio') and f.get('url')]
+    video_only = [f for f in formats if f.get('has_video') and not f.get('has_audio') and f.get('url')]
+    all_video = [f for f in formats if f.get('has_video') and f.get('url')]
+
+    if not all_video:
+        return None
+
+    # Parse target height
+    target = None
+    if quality != "best":
+        try:
+            target = int(quality.replace('p', ''))
+        except ValueError:
+            pass
+
+    def _pick(pool, target_h):
+        """Pick best format from pool at or below target_h (None = best)."""
+        if not pool:
+            return None
+        if target_h is None:
+            return pool[0]  # Already sorted by height descending
+        best = None
+        for fmt in pool:
+            h = fmt.get('height') or 0
+            if h <= target_h and (not best or h > (best.get('height') or 0)):
+                best = fmt
+        return best or pool[-1]
+
+    # Try combined first
+    combined_pick = _pick(combined, target)
+
+    # If combined meets or exceeds the target (or target is "best" and combined is available), use it
+    if combined_pick:
+        combined_h = combined_pick.get('height') or 0
+        if target is None:
+            # "best" quality: check if video-only offers significantly higher resolution
+            video_only_pick = _pick(video_only, None)
+            if video_only_pick:
+                vo_h = video_only_pick.get('height') or 0
+                if vo_h > combined_h:
+                    # Return video-only for higher quality
+                    return video_only_pick
+            return combined_pick
+        elif combined_h >= target:
+            return combined_pick
+
+    # Combined doesn't meet quality — fall back to video-only
+    video_only_pick = _pick(video_only, target)
+    if video_only_pick:
+        return video_only_pick
+
+    # Last resort: anything with video
+    return _pick(all_video, target)
+
+
+def _yt_dlp_format_string(quality: str = "best") -> str:
+    """Build a yt-dlp format selector string for the requested quality."""
+    if quality == "best":
+        return 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+    try:
+        height = int(quality.replace('p', ''))
+    except ValueError:
+        return 'best[ext=mp4]/best'
+    return f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]/best'
+
+
+def download_video_file(url: str, platform: str, proxy_url: Optional[str] = None, quality: str = "best") -> Optional[Dict]:
     """Download video file to memory and return content + metadata"""
     import tempfile
     import os
@@ -1170,7 +1481,8 @@ def download_video_file(url: str, platform: str, proxy_url: Optional[str] = None
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        'format': 'best[ext=mp4]/best',
+        'format': _yt_dlp_format_string(quality),
+        'merge_output_format': 'mp4',
         'outtmpl': tempfile.gettempdir() + '/%(id)s.%(ext)s',
     }
 
@@ -1209,14 +1521,16 @@ def download_video_file(url: str, platform: str, proxy_url: Optional[str] = None
     return None
 
 
-def _try_extract_comments(platform: str, url: str, max_comments: int, proxy_url: Optional[str] = None) -> 'CommentsResponse':
+def _try_extract_comments(platform: str, url: str, max_comments: int,
+                           proxy_url: Optional[str] = None,
+                           twitter_cookies: Optional[str] = None) -> 'CommentsResponse':
     """Dispatch comment extraction to the right platform function."""
     if platform == "youtube":
         return extract_youtube_comments(url, False, max_comments, proxy_url)
     elif platform == "tiktok":
         return extract_tiktok_comments(url, False, max_comments, proxy_url)
     elif platform == "twitter":
-        return extract_twitter_comments(url, False, max_comments, proxy_url)
+        return extract_twitter_comments(url, False, max_comments, proxy_url, twitter_cookies)
     elif platform == "instagram":
         return extract_instagram_comments(url, None, False, max_comments, proxy_url)
     raise ValueError(f"Unsupported platform: {platform}")
@@ -1237,6 +1551,8 @@ async def apify_main():
         extract_comments = actor_input.get("extractComments", False)
         download_video = actor_input.get("downloadVideo", False)
         max_comments = actor_input.get("maxComments", 50)
+        video_quality = actor_input.get("videoQuality", "best")
+        twitter_cookies = actor_input.get("twitterCookies")
 
         if not url:
             await Actor.fail("No URL provided. Please provide a video URL.")
@@ -1313,7 +1629,7 @@ async def apify_main():
                     try:
                         Actor.log.info(f"Comments: trying {strategy_name}...")
                         comments_resp = await asyncio.to_thread(
-                            _try_extract_comments, platform, url, max_comments, strategy_proxy
+                            _try_extract_comments, platform, url, max_comments, strategy_proxy, twitter_cookies
                         )
                         if comments_resp and comments_resp.comments:
                             Actor.log.info(f"Got {len(comments_resp.comments)} comments via {strategy_name}")
@@ -1329,7 +1645,7 @@ async def apify_main():
                         try:
                             Actor.log.info("Comments: trying residential proxy...")
                             comments_resp = await asyncio.to_thread(
-                                _try_extract_comments, platform, url, max_comments, proxy_url
+                                _try_extract_comments, platform, url, max_comments, proxy_url, twitter_cookies
                             )
                             if comments_resp and comments_resp.comments:
                                 Actor.log.info(f"Got {len(comments_resp.comments)} comments via residential proxy")
@@ -1344,52 +1660,94 @@ async def apify_main():
                     result["comments_extracted"] = 0
                     result["comments_error"] = "Could not extract comments with any proxy strategy"
 
-            # Download video if requested - fresh proxy URL with retry
+            # Get video URL / download if requested
             if download_video:
-                Actor.log.info("Downloading video to key-value store...")
-                video_data = None
-                for attempt in range(3):
-                    proxy_url = await fresh_proxy()
-                    try:
-                        video_data = await asyncio.to_thread(
-                            download_video_file, url, platform, proxy_url
-                        )
-                        if video_data:
-                            break
-                    except Exception as e:
-                        Actor.log.warning(f"Download attempt {attempt + 1}/3 failed: {e}")
-                        if attempt == 2:
-                            result["video_error"] = str(e)
-
-                if video_data:
-                    try:
-                        kv_store = await Actor.open_key_value_store()
-                        video_id = result.get('video_id', 'unknown')
-                        ext = video_data.get('ext', 'mp4')
-                        key = f"{platform}_{video_id}.{ext}"
-
-                        await kv_store.set_value(
-                            key,
-                            video_data['content'],
-                            content_type=f"video/{ext}"
-                        )
-
-                        store_id = os.environ.get('APIFY_DEFAULT_KEY_VALUE_STORE_ID', kv_store.id)
-                        public_url = f"https://api.apify.com/v2/key-value-stores/{store_id}/records/{key}"
-
-                        result["video_key"] = key
-                        result["video_url"] = public_url
-                        result["video_stored"] = True
-                        result["video_size_mb"] = round(len(video_data['content']) / (1024 * 1024), 2)
-                        Actor.log.info(f"Video stored: {key} ({result['video_size_mb']} MB)")
-                    except Exception as e:
-                        result["video_error"] = str(e)
+                if platform == "youtube":
+                    # YouTube: return direct format URL (fast, no download needed)
+                    Actor.log.info(f"Selecting YouTube format URL (quality: {video_quality})...")
+                    all_formats = result.get('formats', [])
+                    fmt = select_format_url(all_formats, video_quality)
+                    if fmt and fmt.get('url'):
+                        has_audio = bool(fmt.get('has_audio'))
+                        result["video_url"] = fmt['url']
+                        result["video_quality"] = f"{fmt.get('height', '?')}p"
+                        result["video_has_audio"] = has_audio
                         result["video_stored"] = False
-                        Actor.log.error(f"KV store write failed: {e}")
+                        if has_audio:
+                            result["video_note"] = "Direct YouTube URL with audio (expires in ~6 hours)"
+                        else:
+                            result["video_note"] = "Direct YouTube URL, VIDEO ONLY (no audio track). Use yt-dlp to merge with audio."
+
+                        # Build available format tiers for consumer choice
+                        seen = set()
+                        tiers = []
+                        for f in all_formats:
+                            if f.get('has_video') and f.get('url') and f.get('height'):
+                                h = f['height']
+                                a = bool(f.get('has_audio'))
+                                key = (h, a)
+                                if key not in seen:
+                                    seen.add(key)
+                                    tiers.append({
+                                        "quality": f"{h}p",
+                                        "has_audio": a,
+                                        "url": f['url'],
+                                        "ext": f.get('ext'),
+                                        "format_id": f.get('format_id'),
+                                    })
+                        tiers.sort(key=lambda t: int(t['quality'].replace('p', '')), reverse=True)
+                        result["video_formats"] = tiers
+
+                        Actor.log.info(f"Selected {result['video_quality']} format URL (has_audio={has_audio})")
+                    else:
+                        result["video_error"] = "No suitable YouTube format found"
+                        result["video_stored"] = False
                 else:
-                    if "video_error" not in result:
-                        result["video_error"] = "Could not download video after 3 attempts"
-                    result["video_stored"] = False
+                    # TikTok/Twitter/Instagram: download and store in KV store
+                    Actor.log.info(f"Downloading video to key-value store (quality: {video_quality})...")
+                    video_data = None
+                    for attempt in range(3):
+                        proxy_url = await fresh_proxy()
+                        try:
+                            video_data = await asyncio.to_thread(
+                                download_video_file, url, platform, proxy_url, video_quality
+                            )
+                            if video_data:
+                                break
+                        except Exception as e:
+                            Actor.log.warning(f"Download attempt {attempt + 1}/3 failed: {e}")
+                            if attempt == 2:
+                                result["video_error"] = str(e)
+
+                    if video_data:
+                        try:
+                            kv_store = await Actor.open_key_value_store()
+                            video_id = result.get('video_id', 'unknown')
+                            ext = video_data.get('ext', 'mp4')
+                            key = f"{platform}_{video_id}.{ext}"
+
+                            await kv_store.set_value(
+                                key,
+                                video_data['content'],
+                                content_type=f"video/{ext}"
+                            )
+
+                            store_id = os.environ.get('APIFY_DEFAULT_KEY_VALUE_STORE_ID', kv_store.id)
+                            public_url = f"https://api.apify.com/v2/key-value-stores/{store_id}/records/{key}"
+
+                            result["video_key"] = key
+                            result["video_url"] = public_url
+                            result["video_stored"] = True
+                            result["video_size_mb"] = round(len(video_data['content']) / (1024 * 1024), 2)
+                            Actor.log.info(f"Video stored: {key} ({result['video_size_mb']} MB)")
+                        except Exception as e:
+                            result["video_error"] = str(e)
+                            result["video_stored"] = False
+                            Actor.log.error(f"KV store write failed: {e}")
+                    else:
+                        if "video_error" not in result:
+                            result["video_error"] = "Could not download video after 3 attempts"
+                        result["video_stored"] = False
 
             # Add run metadata
             result["platform"] = platform
