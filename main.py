@@ -359,10 +359,14 @@ def _extract_tweets_from_graphql(data: Any, original_tweet_id: str, seen_ids: se
 def _twitter_comments_playwright(tweet_url: str, tweet_id: Optional[str], max_comments: int,
                                   proxy_url: Optional[str] = None) -> CommentsResponse:
     """Load a tweet page in Playwright and intercept GraphQL TweetDetail responses."""
+    import logging
+    log = logging.getLogger('playwright.twitter')
     from playwright.sync_api import sync_playwright
 
     all_comments: List[Comment] = []
     seen_ids: set = set()
+
+    log.info(f"Launching Playwright for Twitter (proxy={'yes' if proxy_url else 'no'})...")
 
     with sync_playwright() as p:
         launch_kwargs: Dict[str, Any] = {'headless': True}
@@ -379,33 +383,41 @@ def _twitter_comments_playwright(tweet_url: str, tweet_id: Optional[str], max_co
 
         def on_response(response):
             try:
-                if 'TweetDetail' in response.url and response.status == 200:
+                url = response.url
+                if 'TweetDetail' in url and response.status == 200:
                     data = response.json()
                     new = _extract_tweets_from_graphql(data, tweet_id or '', seen_ids)
+                    log.info(f"Intercepted TweetDetail: {len(new)} replies found")
                     all_comments.extend(new)
-            except Exception:
-                pass
+                elif response.status >= 400:
+                    log.info(f"HTTP {response.status}: {url[:120]}")
+            except Exception as exc:
+                log.debug(f"Response handler error: {exc}")
 
         page.on('response', on_response)
 
         try:
+            log.info(f"Navigating to {tweet_url}...")
             page.goto(tweet_url, wait_until='domcontentloaded', timeout=60000)
-            page.wait_for_timeout(5000)
+            log.info(f"Page loaded. Title: {page.title()}")
+            page.wait_for_timeout(8000)
+            log.info(f"After initial wait: {len(all_comments)} comments captured")
 
             # Scroll to load more replies
             scroll_attempts = min(10, max(1, max_comments // 10))
-            for _ in range(scroll_attempts):
+            for i in range(scroll_attempts):
                 if len(all_comments) >= max_comments:
                     break
                 page.evaluate('window.scrollBy(0, 800)')
                 page.wait_for_timeout(2000)
-        except Exception:
-            pass
+            log.info(f"After scrolling: {len(all_comments)} comments total")
+        except Exception as e:
+            log.warning(f"Page interaction error: {e}")
         finally:
             browser.close()
 
     if not all_comments:
-        raise ValueError("Playwright could not extract Twitter comments")
+        raise ValueError("Playwright could not extract Twitter comments (page may require login or didn't load replies)")
 
     return CommentsResponse(
         success=True, video_id=tweet_id, video_title=None,
@@ -731,10 +743,14 @@ def _tiktok_comments_playwright(video_url: str, video_id: str, max_comments: int
                                  video_title: Optional[str], comment_count: Optional[int],
                                  proxy_url: Optional[str] = None) -> CommentsResponse:
     """Load TikTok video page in Playwright and intercept the comments API responses."""
+    import logging
+    log = logging.getLogger('playwright.tiktok')
     from playwright.sync_api import sync_playwright
 
     all_comments: List[Comment] = []
     seen_ids: set = set()
+
+    log.info(f"Launching Playwright for TikTok (proxy={'yes' if proxy_url else 'no'})...")
 
     with sync_playwright() as p:
         launch_kwargs: Dict[str, Any] = {'headless': True}
@@ -751,9 +767,12 @@ def _tiktok_comments_playwright(video_url: str, video_id: str, max_comments: int
 
         def on_response(response):
             try:
-                if '/api/comment/list' in response.url and response.status == 200:
+                url = response.url
+                if '/api/comment/list' in url and response.status == 200:
                     data = response.json()
-                    for c in (data.get('comments') or []):
+                    batch = data.get('comments') or []
+                    log.info(f"Intercepted comment batch: {len(batch)} comments")
+                    for c in batch:
                         cid = str(c.get('cid', ''))
                         if cid and cid in seen_ids:
                             continue
@@ -768,21 +787,25 @@ def _tiktok_comments_playwright(video_url: str, video_id: str, max_comments: int
                             timestamp=c.get('create_time'),
                             reply_count=c.get('reply_comment_total', 0),
                         ))
-            except Exception:
-                pass
+                elif response.status >= 400:
+                    log.info(f"HTTP {response.status}: {url[:120]}")
+            except Exception as exc:
+                log.debug(f"Response handler error: {exc}")
 
         page.on('response', on_response)
 
         try:
+            log.info(f"Navigating to {video_url}...")
             page.goto(video_url, wait_until='domcontentloaded', timeout=60000)
-            page.wait_for_timeout(5000)
+            log.info(f"Page loaded. Title: {page.title()}")
+            page.wait_for_timeout(8000)
+            log.info(f"After initial wait: {len(all_comments)} comments captured")
 
             # Scroll to load more comments (TikTok loads ~20 per batch)
             scroll_attempts = min(10, max(1, max_comments // 20))
-            for _ in range(scroll_attempts):
+            for i in range(scroll_attempts):
                 if len(all_comments) >= max_comments:
                     break
-                # Try scrolling the comments panel, fall back to page scroll
                 page.evaluate("""
                     const panel = document.querySelector('[class*="CommentListContainer"]')
                                 || document.querySelector('[class*="DivCommentListContainer"]');
@@ -790,13 +813,14 @@ def _tiktok_comments_playwright(video_url: str, video_id: str, max_comments: int
                     else { window.scrollBy(0, 600); }
                 """)
                 page.wait_for_timeout(2000)
-        except Exception:
-            pass
+            log.info(f"After scrolling: {len(all_comments)} comments total")
+        except Exception as e:
+            log.warning(f"Page interaction error: {e}")
         finally:
             browser.close()
 
     if not all_comments:
-        raise ValueError("Playwright could not extract TikTok comments")
+        raise ValueError("Playwright could not extract TikTok comments (page may have CAPTCHA or comments didn't load)")
 
     return CommentsResponse(
         success=True, video_id=video_id, video_title=video_title,
@@ -925,8 +949,37 @@ def _tiktok_comments_api(video_id: str, max_comments: int, proxy_url: Optional[s
     )
 
 
-def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
-    """Extract metadata from YouTube using yt-dlp"""
+def _youtube_extract_info(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, proxy_url: Optional[str] = None) -> dict:
+    """Try multiple YouTube player client configs, return the raw yt-dlp info dict."""
+    # Client configs to try in order (iOS first, then fallbacks)
+    client_configs = [
+        ['ios', 'web'],
+        ['tv_embedded', 'web'],
+        ['android', 'web'],
+    ]
+
+    last_error = None
+    for clients in client_configs:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+        }
+        using_proxy = apply_proxy(ydl_opts, use_proxy, proxy_url)
+        if using_proxy:
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': clients}}
+        if cookies_file and os.path.exists(cookies_file) and not using_proxy:
+            ydl_opts['cookiefile'] = cookies_file
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        except Exception as e:
+            last_error = e
+
+    # Final attempt: no specific player client
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -934,90 +987,89 @@ def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_p
         'writesubtitles': True,
         'writeautomaticsub': True,
     }
-
-    # Add proxy if requested
-    using_proxy = apply_proxy(ydl_opts, use_proxy, proxy_url)
-    if using_proxy:
-        # Use Android client when using proxy (bypasses n-challenge)
-        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
-
-    # Add cookies only if NOT using proxy (Android client doesn't support cookies)
-    if cookies_file and os.path.exists(cookies_file) and not using_proxy:
+    apply_proxy(ydl_opts, use_proxy, proxy_url)
+    if cookies_file and os.path.exists(cookies_file):
         ydl_opts['cookiefile'] = cookies_file
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        
-        # Get ALL formats with full details
-        formats = []
-        for fmt in info.get('formats', []):
-            format_data = {
-                'format_id': fmt.get('format_id'),
-                'format_note': fmt.get('format_note'),
-                'ext': fmt.get('ext'),
-                'quality': fmt.get('quality_label') or fmt.get('format_note'),
-                'width': fmt.get('width'),
-                'height': fmt.get('height'),
-                'fps': fmt.get('fps'),
-                'url': fmt.get('url'),  # Direct download URL (expires!)
-                'manifest_url': fmt.get('manifest_url'),
-                'filesize': fmt.get('filesize'),
-                'filesize_approx': fmt.get('filesize_approx'),
-                'vcodec': fmt.get('vcodec'),
-                'acodec': fmt.get('acodec'),
-                'abr': fmt.get('abr'),  # Audio bitrate
-                'vbr': fmt.get('vbr'),  # Video bitrate
-                'asr': fmt.get('asr'),  # Audio sample rate
-                'audio_channels': fmt.get('audio_channels'),
-                'has_video': fmt.get('vcodec') != 'none',
-                'has_audio': fmt.get('acodec') != 'none',
-            }
-            formats.append(format_data)
-        
-        # Sort by quality (height) descending
-        formats.sort(key=lambda x: (x.get('height') or 0, x.get('width') or 0), reverse=True)
-        
-        # Limit formats if not including all
-        if not include_all_formats:
-            # Keep top 5 video+audio, top 5 video-only, top 5 audio-only
-            video_audio = [f for f in formats if f['has_video'] and f['has_audio']][:5]
-            video_only = [f for f in formats if f['has_video'] and not f['has_audio']][:5]
-            audio_only = [f for f in formats if not f['has_video'] and f['has_audio']][:5]
-            formats = video_audio + video_only + audio_only
-        
-        return VideoMetadata(
-            platform='youtube',
-            url=url,
-            title=info.get('title'),
-            description=info.get('description'),
-            duration=info.get('duration'),
-            view_count=info.get('view_count'),
-            like_count=info.get('like_count'),
-            comment_count=info.get('comment_count'),
-            upload_date=info.get('upload_date'),
-            uploader=info.get('uploader'),
-            channel_id=info.get('channel_id'),
-            channel_url=info.get('channel_url'),
-            followers=_get_follower_count(info),
-            thumbnail=info.get('thumbnail'),
-            thumbnails=info.get('thumbnails'),
-            video_id=info.get('id'),
-            formats=formats,
-            subtitles=info.get('subtitles'),
-            tags=info.get('tags'),
-            categories=info.get('categories'),
-            age_limit=info.get('age_limit'),
-            availability=info.get('availability'),
-            live_status=info.get('live_status'),
-            raw_metadata={
-                'webpage_url': info.get('webpage_url'),
-                'original_url': info.get('original_url'),
-                'webpage_url_basename': info.get('webpage_url_basename'),
-                'webpage_url_domain': info.get('webpage_url_domain'),
-                'extractor': info.get('extractor'),
-                'extractor_key': info.get('extractor_key'),
-            }
-        )
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception:
+        raise last_error
+
+
+def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
+    """Extract metadata from YouTube using yt-dlp"""
+    info = _youtube_extract_info(url, cookies_file, use_proxy, proxy_url)
+
+    # Get ALL formats with full details
+    formats = []
+    for fmt in info.get('formats', []):
+        format_data = {
+            'format_id': fmt.get('format_id'),
+            'format_note': fmt.get('format_note'),
+            'ext': fmt.get('ext'),
+            'quality': fmt.get('quality_label') or fmt.get('format_note'),
+            'width': fmt.get('width'),
+            'height': fmt.get('height'),
+            'fps': fmt.get('fps'),
+            'url': fmt.get('url'),
+            'manifest_url': fmt.get('manifest_url'),
+            'filesize': fmt.get('filesize'),
+            'filesize_approx': fmt.get('filesize_approx'),
+            'vcodec': fmt.get('vcodec'),
+            'acodec': fmt.get('acodec'),
+            'abr': fmt.get('abr'),
+            'vbr': fmt.get('vbr'),
+            'asr': fmt.get('asr'),
+            'audio_channels': fmt.get('audio_channels'),
+            'has_video': fmt.get('vcodec') != 'none',
+            'has_audio': fmt.get('acodec') != 'none',
+        }
+        formats.append(format_data)
+
+    # Sort by quality (height) descending
+    formats.sort(key=lambda x: (x.get('height') or 0, x.get('width') or 0), reverse=True)
+
+    # Limit formats if not including all
+    if not include_all_formats:
+        video_audio = [f for f in formats if f['has_video'] and f['has_audio']][:5]
+        video_only = [f for f in formats if f['has_video'] and not f['has_audio']][:5]
+        audio_only = [f for f in formats if not f['has_video'] and f['has_audio']][:5]
+        formats = video_audio + video_only + audio_only
+
+    return VideoMetadata(
+        platform='youtube',
+        url=url,
+        title=info.get('title'),
+        description=info.get('description'),
+        duration=info.get('duration'),
+        view_count=info.get('view_count'),
+        like_count=info.get('like_count'),
+        comment_count=info.get('comment_count'),
+        upload_date=info.get('upload_date'),
+        uploader=info.get('uploader'),
+        channel_id=info.get('channel_id'),
+        channel_url=info.get('channel_url'),
+        followers=_get_follower_count(info),
+        thumbnail=info.get('thumbnail'),
+        thumbnails=info.get('thumbnails'),
+        video_id=info.get('id'),
+        formats=formats,
+        subtitles=info.get('subtitles'),
+        tags=info.get('tags'),
+        categories=info.get('categories'),
+        age_limit=info.get('age_limit'),
+        availability=info.get('availability'),
+        live_status=info.get('live_status'),
+        raw_metadata={
+            'webpage_url': info.get('webpage_url'),
+            'original_url': info.get('original_url'),
+            'webpage_url_basename': info.get('webpage_url_basename'),
+            'webpage_url_domain': info.get('webpage_url_domain'),
+            'extractor': info.get('extractor'),
+            'extractor_key': info.get('extractor_key'),
+        }
+    )
 
 
 def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: int = 100, proxy_url: Optional[str] = None) -> CommentsResponse:
@@ -1032,7 +1084,7 @@ def extract_youtube_comments(url: str, use_proxy: bool = False, max_comments: in
 
     # Add proxy if requested
     if apply_proxy(ydl_opts, use_proxy, proxy_url):
-        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['ios', 'web']}}
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -1342,7 +1394,7 @@ def stream_video_generator(url: str, platform: str, quality: str, use_proxy: boo
         if proxy_url:
             ydl_opts['proxy'] = proxy_url
             if platform == 'youtube':
-                ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+                ydl_opts['extractor_args'] = {'youtube': {'player_client': ['ios', 'web']}}
     
     # Platform-specific options
     if platform == 'instagram':
@@ -1567,7 +1619,7 @@ def download_video_file(url: str, platform: str, proxy_url: Optional[str] = None
 
     if apply_proxy(ydl_opts, proxy_url=proxy_url):
         if platform == 'youtube':
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'web']}}
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['ios', 'web']}}
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1632,7 +1684,8 @@ async def apify_main():
         video_quality = actor_input.get("videoQuality", "best")
 
         if not url:
-            await Actor.fail("No URL provided. Please provide a video URL.")
+            Actor.log.error("No URL provided. Please provide a video URL.")
+            await Actor.fail()
             return
 
         Actor.log.info(f"Processing URL: {url}")
@@ -1683,7 +1736,8 @@ async def apify_main():
                     extract_instagram_metadata, url, None, False, True, proxy_url
                 )
             else:
-                await Actor.fail(f"Unsupported platform for URL: {url}")
+                Actor.log.error(f"Unsupported platform for URL: {url}")
+                await Actor.fail()
                 return
 
             result = metadata.model_dump()
@@ -1838,7 +1892,7 @@ async def apify_main():
 
         except Exception as e:
             Actor.log.error(f"Extraction failed: {str(e)}")
-            await Actor.fail(str(e))
+            await Actor.fail()
 
 
 if __name__ == "__main__":
