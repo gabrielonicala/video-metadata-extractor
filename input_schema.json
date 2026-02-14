@@ -41,13 +41,6 @@
       "default": "best",
       "enum": ["best", "1080p", "720p", "480p", "360p"],
       "editor": "select"
-    },
-    "twitterCookies": {
-      "title": "Twitter Cookies",
-      "type": "string",
-      "description": "Netscape cookies.txt content for Twitter/X authentication (required for comment extraction). Export from browser using 'Get cookies.txt LOCALLY' extension.",
-      "editor": "textarea",
-      "nullable": true
     }
   },
   "required": ["url"]

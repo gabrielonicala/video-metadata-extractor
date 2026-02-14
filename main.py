@@ -87,7 +87,6 @@ class TwitterCommentsRequest(BaseModel):
     url: HttpUrl
     use_proxy: Optional[bool] = Field(default=False, description="Use proxy for extraction")
     max_comments: Optional[int] = Field(default=50, description="Maximum number of comments to fetch (default: 50)")
-    cookies_content: Optional[str] = Field(default=None, description="Netscape cookies.txt content for Twitter auth (needed for comment extraction fallback)")
 
 
 class InstagramRequest(BaseModel):
@@ -149,7 +148,7 @@ class VideoMetadata(BaseModel):
     uploader: Optional[str] = None
     channel_id: Optional[str] = None
     channel_url: Optional[str] = None
-    channel_follower_count: Optional[int] = None
+    followers: Optional[int] = None
     thumbnail: Optional[str] = None
     thumbnails: Optional[List[Dict[str, Any]]] = None
     video_id: Optional[str] = None
@@ -227,7 +226,7 @@ def extract_twitter_metadata(url: str, use_proxy: bool = False, include_all_form
             uploader=info.get('uploader'),
             channel_id=info.get('uploader_id'),
             channel_url=info.get('uploader_url'),
-            channel_follower_count=info.get('channel_follower_count'),
+            followers=info.get('channel_follower_count') or info.get('uploader_follower_count') or info.get('follower_count'),
             thumbnail=info.get('thumbnail'),
             thumbnails=info.get('thumbnails'),
             video_id=info.get('id'),
@@ -291,117 +290,33 @@ def _twitter_comments_ydl(url: str, use_proxy: bool = False, max_comments: int =
         )
 
 
-def _twitter_comments_twscrape(tweet_id: str, max_comments: int, cookies_content: Optional[str] = None) -> CommentsResponse:
-    """Fetch Twitter/X replies using twscrape.
-
-    Requires either:
-    - cookies_content: raw Netscape cookies.txt content for Twitter session
-    - Or returns a clear error explaining authentication is needed
-    """
-    import asyncio as _asyncio
-    from twscrape import API as TwAPI, gather
-
-    async def _fetch():
-        api = TwAPI()
-
-        if cookies_content:
-            # Write cookies to a temp file for twscrape
-            import tempfile
-            cookies_path = os.path.join(tempfile.gettempdir(), 'twitter_cookies.txt')
-            with open(cookies_path, 'w') as f:
-                f.write(cookies_content)
-            try:
-                await api.pool.add_account("cookies_user", "", "", "", cookies=cookies_path)
-                await api.pool.login_all()
-            except Exception as e:
-                raise ValueError(f"Failed to authenticate with Twitter cookies: {e}")
-        else:
-            raise ValueError(
-                "Twitter comment extraction requires authentication. "
-                "Provide 'twitterCookies' (Netscape cookies.txt content) in the actor input. "
-                "Export cookies from your browser after logging into Twitter/X."
-            )
-
-        comments = []
-        try:
-            async for tweet in api.replies(int(tweet_id), limit=max_comments):
-                comments.append(Comment(
-                    author=tweet.user.displayname if tweet.user else None,
-                    author_id=tweet.user.username if tweet.user else None,
-                    text=tweet.rawContent,
-                    like_count=tweet.likeCount,
-                    timestamp=int(tweet.date.timestamp()) if tweet.date else None,
-                    reply_count=tweet.replyCount,
-                ))
-                if len(comments) >= max_comments:
-                    break
-        except Exception as e:
-            if not comments:
-                raise ValueError(f"twscrape replies failed: {e}")
-
-        if not comments:
-            raise ValueError("twscrape returned no replies")
-
-        return CommentsResponse(
-            success=True, video_id=tweet_id, video_title=None,
-            total_comments=len(comments), comments=comments,
-            timestamp=datetime.utcnow().isoformat()
-        )
-
-    # Run the async function
-    try:
-        loop = _asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        # We're inside an event loop (e.g. Apify actor) — use a new thread
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(_asyncio.run, _fetch())
-            return future.result(timeout=120)
-    else:
-        return _asyncio.run(_fetch())
-
-
 def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: int = 50,
-                              proxy_url: Optional[str] = None, cookies_content: Optional[str] = None) -> CommentsResponse:
+                              proxy_url: Optional[str] = None) -> CommentsResponse:
     """Extract comments from a Twitter/X post.
 
-    Strategy:
-      1. Try yt-dlp (no auth needed, but may fail with upstream bugs)
-      2. Fall back to twscrape (requires Twitter cookies for auth)
+    Tries yt-dlp. Twitter/X has heavily restricted their API, so comment
+    extraction may fail due to upstream yt-dlp issues.
     """
     import re
 
-    errors = []
-
-    # Try yt-dlp first
     try:
         return _twitter_comments_ydl(url, use_proxy, max_comments, proxy_url)
     except Exception as e:
-        errors.append(f"yt-dlp: {e}")
+        tweet_id = None
+        match = re.search(r'/status/(\d+)', url)
+        if match:
+            tweet_id = match.group(1)
 
-    # Extract tweet ID for twscrape
-    tweet_id = None
-    match = re.search(r'/status/(\d+)', url)
-    if match:
-        tweet_id = match.group(1)
-
-    if tweet_id:
-        try:
-            return _twitter_comments_twscrape(tweet_id, max_comments, cookies_content)
-        except Exception as e:
-            errors.append(f"twscrape: {e}")
-    else:
-        errors.append("Could not extract tweet ID from URL for twscrape fallback")
-
-    return CommentsResponse(
-        success=False, video_id=tweet_id, video_title=None,
-        total_comments=0, comments=[],
-        error=f"All Twitter comment strategies failed: {'; '.join(errors)}",
-        timestamp=datetime.utcnow().isoformat()
-    )
+        return CommentsResponse(
+            success=False, video_id=tweet_id, video_title=None,
+            total_comments=0, comments=[],
+            error=(
+                f"Twitter/X comment extraction is currently unavailable. "
+                f"Twitter has restricted API access, and yt-dlp's comment extractor "
+                f"is broken upstream (known issue). Error: {e}"
+            ),
+            timestamp=datetime.utcnow().isoformat()
+        )
 
 
 def extract_instagram_metadata(url: str, cookies_file: Optional[str] = None, use_proxy: bool = False, include_all_formats: bool = True, proxy_url: Optional[str] = None) -> VideoMetadata:
@@ -475,7 +390,7 @@ def extract_instagram_metadata(url: str, cookies_file: Optional[str] = None, use
                 uploader=info.get('uploader') or info.get('creator'),
                 channel_id=info.get('uploader_id') or info.get('creator_id'),
                 channel_url=info.get('uploader_url') or info.get('creator_url'),
-                channel_follower_count=info.get('channel_follower_count'),
+                followers=info.get('channel_follower_count') or info.get('uploader_follower_count') or info.get('follower_count'),
                 thumbnail=info.get('thumbnail'),
                 thumbnails=info.get('thumbnails'),
                 video_id=info.get('id'),
@@ -657,7 +572,7 @@ def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_forma
             uploader=info.get('uploader') or info.get('creator'),
             channel_id=info.get('uploader_id') or info.get('creator_id'),
             channel_url=info.get('uploader_url') or info.get('creator_url'),
-            channel_follower_count=info.get('channel_follower_count'),
+            followers=info.get('channel_follower_count') or info.get('uploader_follower_count') or info.get('follower_count'),
             thumbnail=info.get('thumbnail'),
             thumbnails=info.get('thumbnails'),
             video_id=info.get('id'),
@@ -680,8 +595,8 @@ def extract_tiktok_metadata(url: str, use_proxy: bool = False, include_all_forma
         )
 
 
-def _tiktok_comments_tikapi(video_id: str, max_comments: int,
-                             video_title: Optional[str], comment_count: Optional[int]) -> CommentsResponse:
+async def _tiktok_comments_tikapi(video_id: str, max_comments: int,
+                                   video_title: Optional[str], comment_count: Optional[int]) -> CommentsResponse:
     """Fetch TikTok comments using TikTok-Api (Playwright-backed).
 
     This handles the anti-bot tokens (msToken, X-Bogus) that the direct API
@@ -690,30 +605,27 @@ def _tiktok_comments_tikapi(video_id: str, max_comments: int,
     from TikTokApi import TikTokApi
 
     all_comments = []
+    ms_token = os.environ.get("ms_token", None)
 
-    with TikTokApi() as api:
-        video = api.video(id=video_id)
-        for comment in video.comments(count=max_comments):
-            comment_dict = comment.as_dict if hasattr(comment, 'as_dict') else comment
-            if isinstance(comment_dict, dict):
-                user = comment_dict.get('user', {})
+    async with TikTokApi() as api:
+        await api.create_sessions(
+            ms_tokens=[ms_token],
+            num_sessions=1,
+            sleep_after=3,
+            browser=os.environ.get("TIKTOK_BROWSER", "chromium"),
+        )
+        video = api.video(id=int(video_id))
+        async for comment in video.comments(count=max_comments):
+            d = comment.as_dict if hasattr(comment, 'as_dict') else {}
+            if isinstance(d, dict) and d:
+                user = d.get('user', {})
                 all_comments.append(Comment(
                     author=user.get('nickname'),
                     author_id=user.get('unique_id') or user.get('uniqueId'),
-                    text=comment_dict.get('text'),
-                    like_count=comment_dict.get('digg_count') or comment_dict.get('diggCount'),
-                    timestamp=comment_dict.get('create_time') or comment_dict.get('createTime'),
-                    reply_count=comment_dict.get('reply_comment_total') or comment_dict.get('replyCommentTotal', 0),
-                ))
-            else:
-                # comment object with attributes
-                all_comments.append(Comment(
-                    author=getattr(comment, 'author', {}).get('nickname') if isinstance(getattr(comment, 'author', None), dict) else None,
-                    author_id=getattr(comment, 'author', {}).get('unique_id') if isinstance(getattr(comment, 'author', None), dict) else None,
-                    text=getattr(comment, 'text', None),
-                    like_count=getattr(comment, 'likes_count', None),
-                    timestamp=getattr(comment, 'create_time', None),
-                    reply_count=getattr(comment, 'reply_comment_total', 0),
+                    text=d.get('text'),
+                    like_count=d.get('digg_count') or d.get('diggCount'),
+                    timestamp=d.get('create_time') or d.get('createTime'),
+                    reply_count=d.get('reply_comment_total') or d.get('replyCommentTotal', 0),
                 ))
             if len(all_comments) >= max_comments:
                 break
@@ -772,9 +684,23 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
     except Exception as e:
         errors.append(f"Direct API: {e}")
 
-    # Step 3: fall back to TikTok-Api (Playwright-backed)
+    # Step 3: fall back to TikTok-Api (Playwright-backed, async)
     try:
-        return _tiktok_comments_tikapi(video_id, max_comments, video_title, comment_count)
+        import asyncio as _aio
+        try:
+            loop = _aio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            # Already inside an event loop (Apify actor) — run in a new thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(_aio.run, _tiktok_comments_tikapi(video_id, max_comments, video_title, comment_count))
+                result = future.result(timeout=120)
+            return result
+        else:
+            return _aio.run(_tiktok_comments_tikapi(video_id, max_comments, video_title, comment_count))
     except Exception as e:
         errors.append(f"TikTok-Api: {e}")
 
@@ -918,7 +844,7 @@ def extract_youtube_metadata(url: str, cookies_file: Optional[str] = None, use_p
             uploader=info.get('uploader'),
             channel_id=info.get('channel_id'),
             channel_url=info.get('channel_url'),
-            channel_follower_count=info.get('channel_follower_count'),
+            followers=info.get('channel_follower_count') or info.get('uploader_follower_count') or info.get('follower_count'),
             thumbnail=info.get('thumbnail'),
             thumbnails=info.get('thumbnails'),
             video_id=info.get('id'),
@@ -1211,8 +1137,7 @@ def extract_twitter_comments_endpoint(request: TwitterCommentsRequest):
         return extract_twitter_comments(
             str(request.url),
             request.use_proxy,
-            request.max_comments,
-            cookies_content=request.cookies_content
+            request.max_comments
         )
     except Exception as e:
         return CommentsResponse(
@@ -1522,15 +1447,14 @@ def download_video_file(url: str, platform: str, proxy_url: Optional[str] = None
 
 
 def _try_extract_comments(platform: str, url: str, max_comments: int,
-                           proxy_url: Optional[str] = None,
-                           twitter_cookies: Optional[str] = None) -> 'CommentsResponse':
+                           proxy_url: Optional[str] = None) -> 'CommentsResponse':
     """Dispatch comment extraction to the right platform function."""
     if platform == "youtube":
         return extract_youtube_comments(url, False, max_comments, proxy_url)
     elif platform == "tiktok":
         return extract_tiktok_comments(url, False, max_comments, proxy_url)
     elif platform == "twitter":
-        return extract_twitter_comments(url, False, max_comments, proxy_url, twitter_cookies)
+        return extract_twitter_comments(url, False, max_comments, proxy_url)
     elif platform == "instagram":
         return extract_instagram_comments(url, None, False, max_comments, proxy_url)
     raise ValueError(f"Unsupported platform: {platform}")
@@ -1552,7 +1476,6 @@ async def apify_main():
         download_video = actor_input.get("downloadVideo", False)
         max_comments = actor_input.get("maxComments", 50)
         video_quality = actor_input.get("videoQuality", "best")
-        twitter_cookies = actor_input.get("twitterCookies")
 
         if not url:
             await Actor.fail("No URL provided. Please provide a video URL.")
@@ -1629,7 +1552,7 @@ async def apify_main():
                     try:
                         Actor.log.info(f"Comments: trying {strategy_name}...")
                         comments_resp = await asyncio.to_thread(
-                            _try_extract_comments, platform, url, max_comments, strategy_proxy, twitter_cookies
+                            _try_extract_comments, platform, url, max_comments, strategy_proxy
                         )
                         if comments_resp and comments_resp.comments:
                             Actor.log.info(f"Got {len(comments_resp.comments)} comments via {strategy_name}")
@@ -1645,7 +1568,7 @@ async def apify_main():
                         try:
                             Actor.log.info("Comments: trying residential proxy...")
                             comments_resp = await asyncio.to_thread(
-                                _try_extract_comments, platform, url, max_comments, proxy_url, twitter_cookies
+                                _try_extract_comments, platform, url, max_comments, proxy_url
                             )
                             if comments_resp and comments_resp.comments:
                                 Actor.log.info(f"Got {len(comments_resp.comments)} comments via residential proxy")
