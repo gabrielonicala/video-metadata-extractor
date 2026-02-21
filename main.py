@@ -651,20 +651,20 @@ def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: in
     if match:
         tweet_id = match.group(1)
 
-    # Strategy 1: guest-token GraphQL API (no user login required)
+    # Strategy 1: guest-token GraphQL API — try without proxy first (datacenter → Twitter API
+    # may be reachable directly), then retry with proxy if that fails.
+    # yt-dlp is intentionally skipped: Twitter's extractor never supported getcomments
+    # and causes SSL errors when routed through residential proxies.
     if tweet_id:
-        try:
-            return _twitter_comments_guest_api(tweet_id, max_comments, proxy_url)
-        except Exception as e:
-            errors.append(f"Guest API: {e}")
+        for attempt_label, attempt_proxy in [("no proxy", None), ("proxy", proxy_url)]:
+            if attempt_label == "proxy" and not proxy_url:
+                break
+            try:
+                return _twitter_comments_guest_api(tweet_id, max_comments, attempt_proxy)
+            except Exception as e:
+                errors.append(f"Guest API ({attempt_label}): {e}")
 
-    # Strategy 2: yt-dlp
-    try:
-        return _twitter_comments_ydl(url, use_proxy, max_comments, proxy_url)
-    except Exception as e:
-        errors.append(f"yt-dlp: {e}")
-
-    # Strategy 3: Playwright (works best when cookies are provided)
+    # Strategy 2: Playwright (needs proxy; works best when cookies are provided)
     try:
         return _twitter_comments_playwright(url, tweet_id, max_comments, proxy_url, cookies_file)
     except Exception as e:
@@ -1989,7 +1989,8 @@ def _try_extract_comments(platform: str, url: str, max_comments: int,
     if platform == "youtube":
         return extract_youtube_comments(url, False, max_comments, proxy_url)
     elif platform == "tiktok":
-        return extract_tiktok_comments(url, False, max_comments, proxy_url, cookies_file)
+        # TikTokApi generates ms_token via local browser JS — no proxy needed or wanted
+        return extract_tiktok_comments(url, False, max_comments, None, cookies_file)
     elif platform == "twitter":
         return extract_twitter_comments(url, False, max_comments, proxy_url, cookies_file)
     elif platform == "instagram":
