@@ -511,11 +511,9 @@ def _twitter_comments_guest_api(tweet_id: str, max_comments: int,
     """
     import json
 
-    # Twitter web-app Bearer token — publicly embedded in Twitter's JS bundle
-    BEARER = (
-        "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I7wHoAAAAAZeT%2F0%3D"
-        "sLViRkdCe0WxsQ"
-    )
+    # Twitter web-app Bearer token — publicly embedded in Twitter's JS bundle.
+    # Must be the *decoded* string (with literal / and =), not URL-encoded.
+    BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I7wHoAAAAAZeT/0=sLViRkdCe0WxsQ"
 
     proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
     session = requests.Session()
@@ -543,6 +541,11 @@ def _twitter_comments_guest_api(tweet_id: str, max_comments: int,
     if not guest_token:
         raise ValueError("Twitter did not return a guest token")
     session.headers['x-guest-token'] = guest_token
+
+    # ct0 CSRF token — Twitter sets this as a cookie on the guest activate response
+    ct0 = r.cookies.get('ct0') or session.cookies.get('ct0', '')
+    if ct0:
+        session.headers['x-csrf-token'] = ct0
 
     # Step 2: call TweetDetail GraphQL with known query IDs
     # (Twitter rotates these IDs occasionally — we try several in order)
@@ -1135,6 +1138,58 @@ def _tiktok_comments_playwright(video_url: str, video_id: str, max_comments: int
     )
 
 
+def _tiktok_comments_tikapi(video_id: str, max_comments: int,
+                             video_title: Optional[str],
+                             comment_count: Optional[int]) -> CommentsResponse:
+    """Fetch TikTok comments using TikTokApi.
+
+    TikTokApi generates a valid msToken on the fly by running TikTok's own
+    JavaScript in a headless Playwright browser.  This is why it works without
+    user cookies — the token is synthesised, not borrowed from a real session.
+    """
+    import asyncio
+    from TikTokApi import TikTokApi
+
+    all_comments: List[Comment] = []
+
+    async def _fetch() -> None:
+        async with TikTokApi() as api:
+            await api.create_sessions(
+                headless=True,
+                ms_tokens=[''],   # empty string → auto-generate via browser JS
+                num_sessions=1,
+                sleep_after=3,
+            )
+            video = api.video(id=video_id)
+            async for comment in video.comments(count=max_comments):
+                comment_dict = comment.as_dict if hasattr(comment, 'as_dict') else {}
+                if isinstance(comment_dict, dict):
+                    user = comment_dict.get('user', {})
+                    all_comments.append(Comment(
+                        author=user.get('nickname'),
+                        author_id=user.get('unique_id') or user.get('uniqueId'),
+                        text=comment_dict.get('text'),
+                        like_count=comment_dict.get('digg_count') or comment_dict.get('diggCount'),
+                        timestamp=comment_dict.get('create_time') or comment_dict.get('createTime'),
+                        reply_count=comment_dict.get('reply_comment_total') or comment_dict.get('replyCommentTotal', 0),
+                    ))
+                if len(all_comments) >= max_comments:
+                    break
+
+    # asyncio.run() creates a new event loop — safe to call from a thread
+    asyncio.run(_fetch())
+
+    if not all_comments:
+        raise ValueError("TikTokApi returned no comments")
+
+    return CommentsResponse(
+        success=True, video_id=video_id, video_title=video_title,
+        total_comments=comment_count or len(all_comments),
+        comments=all_comments[:max_comments],
+        timestamp=datetime.utcnow().isoformat(),
+    )
+
+
 def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int = 100,
                              proxy_url: Optional[str] = None,
                              cookies_file: Optional[str] = None) -> CommentsResponse:
@@ -1142,10 +1197,8 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
 
     Strategy:
       1. Try the lightweight direct API (no browser needed)
-      2. Fall back to Playwright browser (intercept API responses)
-
-    TikTok now requires login to show comments on most videos.
-    Provide cookies_file (Netscape format from 'Get cookies.txt LOCALLY') for auth.
+      2. TikTokApi — generates msToken via headless browser JS (no user cookies needed)
+      3. Playwright fallback with optional cookies_file
     """
     import re
 
@@ -1176,14 +1229,21 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
             timestamp=datetime.utcnow().isoformat()
         )
 
-    # Step 2: try direct API first (lightweight)
     errors = []
+
+    # Step 2: try direct API (lightweight, rarely succeeds without msToken)
     try:
         return _tiktok_comments_api(video_id, max_comments, proxy_url, video_title, comment_count)
     except Exception as e:
         errors.append(f"Direct API: {e}")
 
-    # Step 3: fall back to Playwright browser (intercept API responses)
+    # Step 3: TikTokApi — generates msToken via Playwright JS (no user cookies)
+    try:
+        return _tiktok_comments_tikapi(video_id, max_comments, video_title, comment_count)
+    except Exception as e:
+        errors.append(f"TikTokApi: {e}")
+
+    # Step 4: raw Playwright fallback (needs proxy + optional cookies)
     if proxy_url:
         try:
             return _tiktok_comments_playwright(
@@ -1193,7 +1253,7 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
         except Exception as e:
             errors.append(f"Playwright: {e}")
     else:
-        errors.append("Playwright: skipped (needs proxy to reach TikTok from datacenter)")
+        errors.append("Playwright: skipped (needs proxy)")
 
     return CommentsResponse(
         success=False, video_id=video_id, video_title=video_title,
@@ -2023,10 +2083,7 @@ async def apify_main():
 
             result = metadata.model_dump()
 
-            # Extract comments if requested
-            # Comment extraction strategy:
-            #   1. No proxy (skipped for TikTok/Twitter; sometimes works for YouTube)
-            #   2. Apify residential proxy (primary proxy — replaces ScrapeOps)
+            # Extract comments if requested — Apify residential proxy is the only strategy
             if extract_comments:
                 Actor.log.info(f"Extracting up to {max_comments} comments...")
                 comments_resp = None
@@ -2080,48 +2137,10 @@ async def apify_main():
 
             # Get video URL / download if requested
             if download_video:
-                if platform == "youtube":
-                    # YouTube: return direct format URL (fast, no download needed)
-                    Actor.log.info(f"Selecting YouTube format URL (quality: {video_quality})...")
-                    all_formats = result.get('formats', [])
-                    fmt = select_format_url(all_formats, video_quality)
-                    if fmt and fmt.get('url'):
-                        has_audio = bool(fmt.get('has_audio'))
-                        result["video_url"] = fmt['url']
-                        result["video_quality"] = f"{fmt.get('height', '?')}p"
-                        result["video_has_audio"] = has_audio
-                        result["video_stored"] = False
-                        if has_audio:
-                            result["video_note"] = "Direct YouTube URL with audio (expires in ~6 hours)"
-                        else:
-                            result["video_note"] = "Direct YouTube URL, VIDEO ONLY (no audio track). Use yt-dlp to merge with audio."
-
-                        # Build available format tiers for consumer choice
-                        seen = set()
-                        tiers = []
-                        for f in all_formats:
-                            if f.get('has_video') and f.get('url') and f.get('height'):
-                                h = f['height']
-                                a = bool(f.get('has_audio'))
-                                key = (h, a)
-                                if key not in seen:
-                                    seen.add(key)
-                                    tiers.append({
-                                        "quality": f"{h}p",
-                                        "has_audio": a,
-                                        "url": f['url'],
-                                        "ext": f.get('ext'),
-                                        "format_id": f.get('format_id'),
-                                    })
-                        tiers.sort(key=lambda t: int(t['quality'].replace('p', '')), reverse=True)
-                        result["video_formats"] = tiers
-
-                        Actor.log.info(f"Selected {result['video_quality']} format URL (has_audio={has_audio})")
-                    else:
-                        result["video_error"] = "No suitable YouTube format found"
-                        result["video_stored"] = False
+                if False:
+                    pass  # placeholder — all platforms now go through download + KV store
                 else:
-                    # TikTok/Twitter/Instagram: download and store in KV store
+                    # Download + merge via yt-dlp (handles bestvideo+bestaudio merge), store in KV store
                     Actor.log.info(f"Downloading video to key-value store (quality: {video_quality})...")
                     video_data = None
                     for attempt in range(3):
