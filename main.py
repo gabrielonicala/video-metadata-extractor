@@ -1140,12 +1140,16 @@ def _tiktok_comments_playwright(video_url: str, video_id: str, max_comments: int
 
 def _tiktok_comments_tikapi(video_id: str, max_comments: int,
                              video_title: Optional[str],
-                             comment_count: Optional[int]) -> CommentsResponse:
+                             comment_count: Optional[int],
+                             proxy_url: Optional[str] = None) -> CommentsResponse:
     """Fetch TikTok comments using TikTokApi.
 
     TikTokApi generates a valid msToken on the fly by running TikTok's own
     JavaScript in a headless Playwright browser.  This is why it works without
     user cookies — the token is synthesised, not borrowed from a real session.
+
+    A proxy is required when running from a datacenter IP (e.g. Apify containers)
+    because TikTok blocks datacenter IPs from loading tiktok.com in the browser.
     """
     import asyncio
     from TikTokApi import TikTokApi
@@ -1153,12 +1157,14 @@ def _tiktok_comments_tikapi(video_id: str, max_comments: int,
     all_comments: List[Comment] = []
 
     async def _fetch() -> None:
+        proxies = [proxy_url] if proxy_url else None
         async with TikTokApi() as api:
             await api.create_sessions(
                 headless=True,
                 ms_tokens=[''],   # empty string → auto-generate via browser JS
                 num_sessions=1,
                 sleep_after=3,
+                proxies=proxies,  # needed to reach tiktok.com from datacenter IPs
             )
             video = api.video(id=video_id)
             async for comment in video.comments(count=max_comments):
@@ -1242,9 +1248,10 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
     except Exception as e:
         errors.append(f"Direct API: {e}")
 
-    # Step 3: TikTokApi — generates msToken via Playwright JS (no user cookies)
+    # Step 3: TikTokApi — generates msToken via Playwright JS (no user cookies).
+    # Proxy is required from Apify datacenter IPs: tiktok.com blocks datacenter egress.
     try:
-        return _tiktok_comments_tikapi(video_id, max_comments, video_title, comment_count)
+        return _tiktok_comments_tikapi(video_id, max_comments, video_title, comment_count, proxy_url)
     except Exception as e:
         errors.append(f"TikTokApi: {e}")
 
@@ -1980,24 +1987,27 @@ def download_youtube_video(url: str, proxy_url: Optional[str] = None, quality: s
     tmp_dir = tempfile.mkdtemp(prefix='yt_dl_')
     try:
         if not requested_formats:
-            # Single combined stream — download directly
+            # Single combined stream
             stream_url = info.get('url')
             if not stream_url:
                 raise RuntimeError("No download URL in YouTube info")
             stream_path = os.path.join(tmp_dir, f"stream.{info.get('ext', 'mp4')}")
-            _direct_download(stream_url, stream_path)
+            _direct_download(stream_url, stream_path, proxy_url=proxy_url)
             with open(stream_path, 'rb') as f:
                 content = f.read()
             return {'content': content, 'ext': info.get('ext', 'mp4'), 'video_id': video_id, 'size': len(content)}
 
-        # Phase 2: download each stream directly (no proxy)
+        # Phase 2: download each stream through the same proxy used for info extraction.
+        # The signed googlevideo.com URL embeds the proxy's IP address — it is IP-locked,
+        # so we MUST use the same proxy.  We use requests with large 8 MB chunks (vs
+        # yt-dlp's small segments) to minimise per-request overhead and maximise throughput.
         stream_paths = []
         for i, fmt in enumerate(requested_formats):
             stream_url = fmt.get('url')
             if not stream_url:
                 raise RuntimeError(f"No URL for format index {i}")
             stream_path = os.path.join(tmp_dir, f"stream_{i}.{fmt.get('ext', 'mp4')}")
-            _direct_download(stream_url, stream_path)
+            _direct_download(stream_url, stream_path, proxy_url=proxy_url)
             stream_paths.append(stream_path)
 
         if len(stream_paths) == 1:
@@ -2025,10 +2035,16 @@ def download_youtube_video(url: str, proxy_url: Optional[str] = None, quality: s
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _direct_download(url: str, dest_path: str) -> None:
-    """Download a URL directly to a file without a proxy (for CDN streams)."""
+def _direct_download(url: str, dest_path: str, proxy_url: Optional[str] = None) -> None:
+    """Stream-download a URL to a file using large chunks for maximum throughput.
+
+    proxy_url — if provided, routes the download through this proxy.  YouTube CDN
+    URLs embed the requesting IP, so they must be downloaded through the same proxy
+    that was used to obtain them.
+    """
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    with requests.get(url, stream=True, timeout=600, headers=headers) as r:
+    proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
+    with requests.get(url, stream=True, timeout=600, headers=headers, proxies=proxies) as r:
         r.raise_for_status()
         with open(dest_path, 'wb') as f:
             for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
@@ -2088,8 +2104,9 @@ def _try_extract_comments(platform: str, url: str, max_comments: int,
     if platform == "youtube":
         return extract_youtube_comments(url, False, max_comments, proxy_url)
     elif platform == "tiktok":
-        # TikTokApi generates ms_token via local browser JS — no proxy needed or wanted
-        return extract_tiktok_comments(url, False, max_comments, None, cookies_file)
+        # Proxy is needed: TikTokApi uses a headless browser to reach tiktok.com,
+        # which blocks Apify's datacenter IPs without a proxy.
+        return extract_tiktok_comments(url, False, max_comments, proxy_url, cookies_file)
     elif platform == "twitter":
         return extract_twitter_comments(url, False, max_comments, proxy_url, cookies_file)
     elif platform == "instagram":
