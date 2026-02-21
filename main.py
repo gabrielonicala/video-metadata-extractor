@@ -91,6 +91,40 @@ def _playwright_proxy_config(proxy_url: str) -> dict:
         config['password'] = parsed.password
     return config
 
+
+def _load_netscape_cookies(cookies_file: str, domain_filter: Optional[str] = None) -> List[Dict]:
+    """Parse a Netscape cookies.txt file into Playwright cookie dicts."""
+    cookies: List[Dict] = []
+    try:
+        with open(cookies_file, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split('\t')
+                if len(parts) < 7:
+                    continue
+                domain, _flag, path, secure, expiry, name, value = parts[:7]
+                if domain_filter and domain_filter not in domain:
+                    continue
+                cookie: Dict[str, Any] = {
+                    'name': name,
+                    'value': value,
+                    'domain': domain if domain.startswith('.') else '.' + domain,
+                    'path': path,
+                    'secure': secure.upper() == 'TRUE',
+                    'httpOnly': False,
+                }
+                try:
+                    if expiry and expiry != '0':
+                        cookie['expires'] = int(float(expiry))
+                except (ValueError, OverflowError):
+                    pass
+                cookies.append(cookie)
+    except Exception:
+        pass
+    return cookies
+
 class VideoRequest(BaseModel):
     url: HttpUrl
     cookies_file: Optional[str] = Field(default=None, description="Path to cookies file for authentication")
@@ -111,6 +145,7 @@ class TwitterCommentsRequest(BaseModel):
     url: HttpUrl
     use_proxy: Optional[bool] = Field(default=False, description="Use proxy for extraction")
     max_comments: Optional[int] = Field(default=50, description="Maximum number of comments to fetch (default: 50)")
+    cookies_file: Optional[str] = Field(default="twitter_cookies.txt", description="Path to Twitter/X cookies file (Netscape format). Required to see replies — export via 'Get cookies.txt LOCALLY' after logging into x.com.")
 
 
 class InstagramRequest(BaseModel):
@@ -357,7 +392,8 @@ def _extract_tweets_from_graphql(data: Any, original_tweet_id: str, seen_ids: se
 
 
 def _twitter_comments_playwright(tweet_url: str, tweet_id: Optional[str], max_comments: int,
-                                  proxy_url: Optional[str] = None) -> CommentsResponse:
+                                  proxy_url: Optional[str] = None,
+                                  cookies_file: Optional[str] = None) -> CommentsResponse:
     """Load a tweet page in Playwright and intercept GraphQL TweetDetail responses."""
     import logging
     log = logging.getLogger('playwright.twitter')
@@ -384,6 +420,18 @@ def _twitter_comments_playwright(tweet_url: str, tweet_id: Optional[str], max_co
             locale='en-US',
         )
         context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        # Load auth cookies — Twitter requires a logged-in session to see replies
+        if cookies_file and os.path.exists(cookies_file):
+            tw_cookies = _load_netscape_cookies(cookies_file)
+            if tw_cookies:
+                context.add_cookies(tw_cookies)
+                log.info(f"Loaded {len(tw_cookies)} Twitter cookies from {cookies_file}")
+            else:
+                log.warning(f"Twitter cookies file {cookies_file!r} is empty or unparseable")
+        else:
+            log.warning("No Twitter cookies provided — replies may be hidden behind login wall")
+
         page = context.new_page()
 
         def on_response(response):
@@ -454,12 +502,16 @@ def _twitter_comments_playwright(tweet_url: str, tweet_id: Optional[str], max_co
 
 
 def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: int = 50,
-                              proxy_url: Optional[str] = None) -> CommentsResponse:
+                              proxy_url: Optional[str] = None,
+                              cookies_file: Optional[str] = None) -> CommentsResponse:
     """Extract comments from a Twitter/X post.
 
     Strategy:
       1. Try yt-dlp (fast, may fail due to upstream bugs)
       2. Fall back to Playwright browser (intercept GraphQL responses)
+
+    Twitter requires a logged-in session to see replies. Provide cookies_file
+    (Netscape format, e.g. exported via "Get cookies.txt LOCALLY") for auth.
     """
     import re
 
@@ -477,7 +529,7 @@ def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: in
 
     # Fall back to Playwright
     try:
-        return _twitter_comments_playwright(url, tweet_id, max_comments, proxy_url)
+        return _twitter_comments_playwright(url, tweet_id, max_comments, proxy_url, cookies_file)
     except Exception as e:
         errors.append(f"Playwright: {e}")
 
@@ -1414,7 +1466,8 @@ def extract_twitter_comments_endpoint(request: TwitterCommentsRequest):
         return extract_twitter_comments(
             str(request.url),
             request.use_proxy,
-            request.max_comments
+            request.max_comments,
+            cookies_file=request.cookies_file,
         )
     except Exception as e:
         return CommentsResponse(
@@ -1720,14 +1773,15 @@ def download_video_file(url: str, platform: str, proxy_url: Optional[str] = None
 
 
 def _try_extract_comments(platform: str, url: str, max_comments: int,
-                           proxy_url: Optional[str] = None) -> 'CommentsResponse':
+                           proxy_url: Optional[str] = None,
+                           cookies_file: Optional[str] = None) -> 'CommentsResponse':
     """Dispatch comment extraction to the right platform function."""
     if platform == "youtube":
         return extract_youtube_comments(url, False, max_comments, proxy_url)
     elif platform == "tiktok":
         return extract_tiktok_comments(url, False, max_comments, proxy_url)
     elif platform == "twitter":
-        return extract_twitter_comments(url, False, max_comments, proxy_url)
+        return extract_twitter_comments(url, False, max_comments, proxy_url, cookies_file)
     elif platform == "instagram":
         return extract_instagram_comments(url, None, False, max_comments, proxy_url)
     raise ValueError(f"Unsupported platform: {platform}")
@@ -1749,6 +1803,7 @@ async def apify_main():
         download_video = actor_input.get("downloadVideo", False)
         max_comments = actor_input.get("maxComments", 50)
         video_quality = actor_input.get("videoQuality", "best")
+        twitter_cookies_file = actor_input.get("twitterCookiesFile", "twitter_cookies.txt")
 
         if not url:
             Actor.log.error("No URL provided. Please provide a video URL.")
@@ -1818,24 +1873,27 @@ async def apify_main():
             result = metadata.model_dump()
 
             # Extract comments if requested
-            # Comment APIs are sensitive to proxy choice - use a fallback chain:
-            #   1. No proxy (datacenter IP - works for Twitter, sometimes YouTube)
-            #   2. ScrapeOps proxy (proven to work for YouTube comments)
-            #   3. Apify residential proxy (last resort)
+            # Comment extraction strategy:
+            #   1. No proxy (skipped for TikTok/Twitter; sometimes works for YouTube)
+            #   2. Apify residential proxy (primary proxy — replaces ScrapeOps)
             if extract_comments:
                 Actor.log.info(f"Extracting up to {max_comments} comments...")
                 comments_resp = None
 
-                strategies = [
-                    ("no proxy", None),
-                    ("ScrapeOps proxy", SCRAPEOPS_PROXY),
-                ]
+                # TikTok and Twitter always need a residential proxy from a datacenter —
+                # skip the pointless no-proxy attempt and go straight to residential.
+                # YouTube/Instagram are tried without a proxy first (saves time when it works).
+                if platform in ("tiktok", "twitter"):
+                    pre_strategies = []
+                else:
+                    pre_strategies = [("no proxy", None)]
 
-                for strategy_name, strategy_proxy in strategies:
+                for strategy_name, strategy_proxy in pre_strategies:
                     try:
                         Actor.log.info(f"Comments: trying {strategy_name}...")
                         comments_resp = await asyncio.to_thread(
-                            _try_extract_comments, platform, url, max_comments, strategy_proxy
+                            _try_extract_comments, platform, url, max_comments, strategy_proxy,
+                            twitter_cookies_file if platform == "twitter" else None
                         )
                         if comments_resp and comments_resp.comments:
                             Actor.log.info(f"Got {len(comments_resp.comments)} comments via {strategy_name}")
@@ -1844,19 +1902,20 @@ async def apify_main():
                         Actor.log.info(f"Comments {strategy_name}: {e}")
                         comments_resp = None
 
-                # Last resort: Apify residential proxy
+                # Apify residential proxy — primary proxy strategy (replaces ScrapeOps)
                 if not (comments_resp and comments_resp.comments):
                     proxy_url = await fresh_proxy()
                     if proxy_url:
                         try:
-                            Actor.log.info("Comments: trying residential proxy...")
+                            Actor.log.info("Comments: trying Apify residential proxy...")
                             comments_resp = await asyncio.to_thread(
-                                _try_extract_comments, platform, url, max_comments, proxy_url
+                                _try_extract_comments, platform, url, max_comments, proxy_url,
+                                twitter_cookies_file if platform == "twitter" else None
                             )
                             if comments_resp and comments_resp.comments:
                                 Actor.log.info(f"Got {len(comments_resp.comments)} comments via residential proxy")
                         except Exception as e:
-                            Actor.log.warning(f"All comment strategies failed. Last: {e}")
+                            Actor.log.warning(f"All comment strategies failed. Last error: {e}")
 
                 if comments_resp and comments_resp.comments:
                     result["comments"] = [c.model_dump() for c in comments_resp.comments]

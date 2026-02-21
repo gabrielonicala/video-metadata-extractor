@@ -41,6 +41,13 @@
       "default": "best",
       "enum": ["best", "1080p", "720p", "480p", "360p"],
       "editor": "select"
+    },
+    "twitterCookiesFile": {
+      "title": "Twitter/X Cookies File",
+      "type": "string",
+      "description": "Path to a Netscape-format cookies file for Twitter/X (e.g. twitter_cookies.txt). Required to extract replies — export via the 'Get cookies.txt LOCALLY' browser extension after logging into x.com. Leave blank to attempt without auth (most replies will be hidden).",
+      "default": "twitter_cookies.txt",
+      "editor": "textfield"
     }
   },
   "required": ["url"]
