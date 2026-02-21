@@ -1162,7 +1162,12 @@ def _tiktok_comments_tikapi(video_id: str, max_comments: int,
             )
             video = api.video(id=video_id)
             async for comment in video.comments(count=max_comments):
-                comment_dict = comment.as_dict if hasattr(comment, 'as_dict') else {}
+                # TikTokApi v6 uses .data; older builds used .as_dict — try both
+                comment_dict = (
+                    comment.data if hasattr(comment, 'data') and isinstance(comment.data, dict)
+                    else comment.as_dict if hasattr(comment, 'as_dict') and isinstance(comment.as_dict, dict)
+                    else {}
+                )
                 if isinstance(comment_dict, dict):
                     user = comment_dict.get('user', {})
                     all_comments.append(Comment(
@@ -1936,6 +1941,100 @@ def _yt_dlp_format_string(quality: str = "best") -> str:
     return f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]/best'
 
 
+def download_youtube_video(url: str, proxy_url: Optional[str] = None, quality: str = "best") -> Optional[Dict]:
+    """Download a YouTube video by separating proxy usage from the actual download.
+
+    Phase 1 — Info extraction (via proxy, fast):
+        yt-dlp calls YouTube's API through the residential proxy to get
+        authenticated, signed googlevideo.com CDN URLs.
+
+    Phase 2 — Stream download (direct, no proxy):
+        The signed CDN URLs are NOT IP-locked so we download the raw
+        video and audio streams directly at full ISP speed.
+
+    Phase 3 — ffmpeg merge:
+        ffmpeg combines the two streams into a single MP4 in /tmp.
+    """
+    import tempfile
+    import subprocess
+    import shutil
+    import os
+
+    # Phase 1: get format info via proxy (fast — no data transfer)
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'format': _yt_dlp_format_string(quality),
+    }
+    apply_proxy(ydl_opts, proxy_url=proxy_url)
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        raise RuntimeError(f"yt-dlp info extraction failed: {e}")
+
+    video_id = info.get('id', 'unknown')
+    requested_formats = info.get('requested_formats') or []
+
+    tmp_dir = tempfile.mkdtemp(prefix='yt_dl_')
+    try:
+        if not requested_formats:
+            # Single combined stream — download directly
+            stream_url = info.get('url')
+            if not stream_url:
+                raise RuntimeError("No download URL in YouTube info")
+            stream_path = os.path.join(tmp_dir, f"stream.{info.get('ext', 'mp4')}")
+            _direct_download(stream_url, stream_path)
+            with open(stream_path, 'rb') as f:
+                content = f.read()
+            return {'content': content, 'ext': info.get('ext', 'mp4'), 'video_id': video_id, 'size': len(content)}
+
+        # Phase 2: download each stream directly (no proxy)
+        stream_paths = []
+        for i, fmt in enumerate(requested_formats):
+            stream_url = fmt.get('url')
+            if not stream_url:
+                raise RuntimeError(f"No URL for format index {i}")
+            stream_path = os.path.join(tmp_dir, f"stream_{i}.{fmt.get('ext', 'mp4')}")
+            _direct_download(stream_url, stream_path)
+            stream_paths.append(stream_path)
+
+        if len(stream_paths) == 1:
+            with open(stream_paths[0], 'rb') as f:
+                content = f.read()
+            return {'content': content, 'ext': 'mp4', 'video_id': video_id, 'size': len(content)}
+
+        # Phase 3: merge with ffmpeg
+        output_path = os.path.join(tmp_dir, f"{video_id}.mp4")
+        cmd = ['ffmpeg', '-y']
+        for sp in stream_paths:
+            cmd += ['-i', sp]
+        cmd += ['-c:v', 'copy', '-c:a', 'copy', output_path]
+
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg merge failed: {result.stderr.decode(errors='replace')}")
+
+        with open(output_path, 'rb') as f:
+            content = f.read()
+
+        return {'content': content, 'ext': 'mp4', 'video_id': video_id, 'size': len(content)}
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _direct_download(url: str, dest_path: str) -> None:
+    """Download a URL directly to a file without a proxy (for CDN streams)."""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    with requests.get(url, stream=True, timeout=600, headers=headers) as r:
+        r.raise_for_status()
+        with open(dest_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                f.write(chunk)
+
+
 def download_video_file(url: str, platform: str, proxy_url: Optional[str] = None, quality: str = "best") -> Optional[Dict]:
     """Download video file to memory and return content + metadata"""
     import tempfile
@@ -2138,12 +2237,21 @@ async def apify_main():
 
             # Get video URL / download if requested
             if download_video:
-                if False:
-                    pass  # placeholder — all platforms now go through download + KV store
+                video_data = None
+                if platform == "youtube":
+                    # YouTube: proxy only for info extraction; CDN streams downloaded directly (fast)
+                    Actor.log.info(f"Downloading YouTube video (quality: {video_quality}): proxy for info only, direct CDN download...")
+                    proxy_url = await fresh_proxy()
+                    try:
+                        video_data = await asyncio.to_thread(
+                            download_youtube_video, url, proxy_url, video_quality
+                        )
+                    except Exception as e:
+                        Actor.log.warning(f"YouTube download failed: {e}")
+                        result["video_error"] = str(e)
                 else:
-                    # Download + merge via yt-dlp (handles bestvideo+bestaudio merge), store in KV store
+                    # TikTok / Twitter: smaller files, full download via proxy
                     Actor.log.info(f"Downloading video to key-value store (quality: {video_quality})...")
-                    video_data = None
                     for attempt in range(3):
                         proxy_url = await fresh_proxy()
                         try:
@@ -2157,35 +2265,36 @@ async def apify_main():
                             if attempt == 2:
                                 result["video_error"] = str(e)
 
-                    if video_data:
-                        try:
-                            kv_store = await Actor.open_key_value_store()
-                            video_id = result.get('video_id', 'unknown')
-                            ext = video_data.get('ext', 'mp4')
-                            key = f"{platform}_{video_id}.{ext}"
+                # Store in KV store (all platforms)
+                if video_data:
+                    try:
+                        kv_store = await Actor.open_key_value_store()
+                        video_id = result.get('video_id', 'unknown')
+                        ext = video_data.get('ext', 'mp4')
+                        key = f"{platform}_{video_id}.{ext}"
 
-                            await kv_store.set_value(
-                                key,
-                                video_data['content'],
-                                content_type=f"video/{ext}"
-                            )
+                        await kv_store.set_value(
+                            key,
+                            video_data['content'],
+                            content_type=f"video/{ext}"
+                        )
 
-                            store_id = os.environ.get('APIFY_DEFAULT_KEY_VALUE_STORE_ID', kv_store.id)
-                            public_url = f"https://api.apify.com/v2/key-value-stores/{store_id}/records/{key}"
+                        store_id = os.environ.get('APIFY_DEFAULT_KEY_VALUE_STORE_ID', kv_store.id)
+                        public_url = f"https://api.apify.com/v2/key-value-stores/{store_id}/records/{key}"
 
-                            result["video_key"] = key
-                            result["video_url"] = public_url
-                            result["video_stored"] = True
-                            result["video_size_mb"] = round(len(video_data['content']) / (1024 * 1024), 2)
-                            Actor.log.info(f"Video stored: {key} ({result['video_size_mb']} MB)")
-                        except Exception as e:
-                            result["video_error"] = str(e)
-                            result["video_stored"] = False
-                            Actor.log.error(f"KV store write failed: {e}")
-                    else:
-                        if "video_error" not in result:
-                            result["video_error"] = "Could not download video after 3 attempts"
+                        result["video_key"] = key
+                        result["video_url"] = public_url
+                        result["video_stored"] = True
+                        result["video_size_mb"] = round(len(video_data['content']) / (1024 * 1024), 2)
+                        Actor.log.info(f"Video stored: {key} ({result['video_size_mb']} MB)")
+                    except Exception as e:
+                        result["video_error"] = str(e)
                         result["video_stored"] = False
+                        Actor.log.error(f"KV store write failed: {e}")
+                else:
+                    if "video_error" not in result:
+                        result["video_error"] = "Could not download video"
+                    result["video_stored"] = False
 
             # Add run metadata
             result["platform"] = platform
