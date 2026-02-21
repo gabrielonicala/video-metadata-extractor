@@ -45,8 +45,15 @@
     "twitterCookiesFile": {
       "title": "Twitter/X Cookies File",
       "type": "string",
-      "description": "Path to a Netscape-format cookies file for Twitter/X (e.g. twitter_cookies.txt). Required to extract replies — export via the 'Get cookies.txt LOCALLY' browser extension after logging into x.com. Leave blank to attempt without auth (most replies will be hidden).",
+      "description": "Path to a Netscape-format cookies file for Twitter/X (e.g. twitter_cookies.txt). Optional — the actor first tries the guest-token API (no login needed); cookies are only used as a fallback via Playwright.",
       "default": "twitter_cookies.txt",
+      "editor": "textfield"
+    },
+    "tiktokCookiesFile": {
+      "title": "TikTok Cookies File",
+      "type": "string",
+      "description": "Path to a Netscape-format cookies file for TikTok (e.g. tiktok_cookies.txt). Required to extract comments — TikTok now hides comments behind login for unauthenticated requests. Export via the 'Get cookies.txt LOCALLY' browser extension after logging into tiktok.com.",
+      "default": "tiktok_cookies.txt",
       "editor": "textfield"
     }
   },

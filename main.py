@@ -501,6 +501,133 @@ def _twitter_comments_playwright(tweet_url: str, tweet_id: Optional[str], max_co
     )
 
 
+def _twitter_comments_guest_api(tweet_id: str, max_comments: int,
+                                 proxy_url: Optional[str] = None) -> CommentsResponse:
+    """Fetch Twitter/X replies via the guest-token GraphQL API (no user login required).
+
+    Twitter's web app embeds a Bearer token in its JavaScript.  Combined with a
+    short-lived guest token from /1.1/guest/activate.json, this lets us call the
+    TweetDetail GraphQL endpoint without any user cookies.
+    """
+    import json
+
+    # Twitter web-app Bearer token — publicly embedded in Twitter's JS bundle
+    BEARER = (
+        "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I7wHoAAAAAZeT%2F0%3D"
+        "sLViRkdCe0WxsQ"
+    )
+
+    proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
+    session = requests.Session()
+    session.headers.update({
+        'Authorization': f'Bearer {BEARER}',
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+            '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        ),
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://x.com/',
+        'Origin': 'https://x.com',
+        'x-twitter-active-user': 'yes',
+        'x-twitter-client-language': 'en',
+    })
+
+    # Step 1: get a guest token
+    r = session.post(
+        'https://api.twitter.com/1.1/guest/activate.json',
+        proxies=proxies, timeout=20,
+    )
+    r.raise_for_status()
+    guest_token = r.json().get('guest_token')
+    if not guest_token:
+        raise ValueError("Twitter did not return a guest token")
+    session.headers['x-guest-token'] = guest_token
+
+    # Step 2: call TweetDetail GraphQL with known query IDs
+    # (Twitter rotates these IDs occasionally — we try several in order)
+    variables = {
+        'focalTweetId': tweet_id,
+        'referrer': 'home',
+        'count': min(max_comments, 100),
+        'includePromotedContent': False,
+        'withCommunity': True,
+        'withQuickPromoteEligibilityTweetFields': True,
+        'withBirdwatchNotes': True,
+        'withVoice': True,
+        'withV2Timeline': True,
+    }
+    features = {
+        'rweb_lists_timeline_redesign_enabled': True,
+        'responsive_web_graphql_exclude_directive_enabled': True,
+        'verified_phone_label_enabled': False,
+        'creator_subscriptions_tweet_preview_api_enabled': True,
+        'responsive_web_graphql_timeline_navigation_enabled': True,
+        'responsive_web_graphql_skip_user_profile_image_extensions_enabled': False,
+        'tweetypie_unmention_optimization_enabled': True,
+        'responsive_web_edit_tweet_api_enabled': True,
+        'graphql_is_translatable_rweb_tweet_is_translatable_enabled': True,
+        'view_counts_everywhere_api_enabled': True,
+        'longform_notetweets_consumption_enabled': True,
+        'tweet_awards_web_tipping_enabled': False,
+        'freedom_of_speech_not_reach_appeal_label_enabled': False,
+        'standardized_nudges_misinfo': True,
+        'tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled': True,
+        'longform_notetweets_rich_text_read_enabled': True,
+        'longform_notetweets_inline_media_enabled': True,
+        'responsive_web_media_download_video_enabled': False,
+        'responsive_web_enhance_cards_enabled': False,
+    }
+    params = {
+        'variables': json.dumps(variables, separators=(',', ':')),
+        'features': json.dumps(features, separators=(',', ':')),
+    }
+
+    query_ids = [
+        'VWFGPVAGkZENbrHFNUuQsg',
+        'B9_KmbkLhXt6jRwGjJrweg',
+        'NmCeCgkVlsRGS55qb4o4NA',
+        'xOhkmRKnwYYUr4c2T1IZ4A',
+        '3XDB26fBve-MmjHaWTUZxA',
+        'BoHLKeBvibdYDiJON1oqTg',
+    ]
+
+    data = None
+    for qid in query_ids:
+        try:
+            r = session.get(
+                f'https://x.com/i/api/graphql/{qid}/TweetDetail',
+                params=params, proxies=proxies, timeout=30,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                break
+            if r.status_code == 403:
+                raise ValueError("Twitter rejected guest token (403) — replies may require login")
+        except ValueError:
+            raise
+        except Exception:
+            continue
+
+    if not data:
+        raise ValueError("TweetDetail GraphQL failed for all known query IDs")
+
+    seen_ids: set = set()
+    comments = _extract_tweets_from_graphql(data, tweet_id, seen_ids)
+
+    if not comments:
+        raise ValueError("Guest API returned no replies (tweet may have none, or requires login)")
+
+    return CommentsResponse(
+        success=True,
+        video_id=tweet_id,
+        video_title=None,
+        total_comments=len(comments),
+        comments=comments[:max_comments],
+        timestamp=datetime.utcnow().isoformat(),
+    )
+
+
 def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: int = 50,
                               proxy_url: Optional[str] = None,
                               cookies_file: Optional[str] = None) -> CommentsResponse:
@@ -521,13 +648,20 @@ def extract_twitter_comments(url: str, use_proxy: bool = False, max_comments: in
     if match:
         tweet_id = match.group(1)
 
-    # Try yt-dlp first
+    # Strategy 1: guest-token GraphQL API (no user login required)
+    if tweet_id:
+        try:
+            return _twitter_comments_guest_api(tweet_id, max_comments, proxy_url)
+        except Exception as e:
+            errors.append(f"Guest API: {e}")
+
+    # Strategy 2: yt-dlp
     try:
         return _twitter_comments_ydl(url, use_proxy, max_comments, proxy_url)
     except Exception as e:
         errors.append(f"yt-dlp: {e}")
 
-    # Fall back to Playwright
+    # Strategy 3: Playwright (works best when cookies are provided)
     try:
         return _twitter_comments_playwright(url, tweet_id, max_comments, proxy_url, cookies_file)
     except Exception as e:
@@ -851,7 +985,8 @@ def _extract_comments_from_tiktok_data(data: Any, comments_list: List[Comment], 
 
 def _tiktok_comments_playwright(video_url: str, video_id: str, max_comments: int,
                                  video_title: Optional[str], comment_count: Optional[int],
-                                 proxy_url: Optional[str] = None) -> CommentsResponse:
+                                 proxy_url: Optional[str] = None,
+                                 cookies_file: Optional[str] = None) -> CommentsResponse:
     """Load TikTok video page in Playwright and intercept the comments API responses."""
     import logging
     import json
@@ -879,6 +1014,18 @@ def _tiktok_comments_playwright(video_url: str, video_id: str, max_comments: int
             locale='en-US',
         )
         context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        # Load TikTok auth cookies if provided — TikTok requires login to show comments
+        if cookies_file and os.path.exists(cookies_file):
+            tk_cookies = _load_netscape_cookies(cookies_file)
+            if tk_cookies:
+                context.add_cookies(tk_cookies)
+                log.info(f"Loaded {len(tk_cookies)} TikTok cookies from {cookies_file}")
+            else:
+                log.warning(f"TikTok cookies file {cookies_file!r} is empty or unparseable")
+        else:
+            log.warning("No TikTok cookies provided — comment section may require login")
+
         page = context.new_page()
 
         def on_response(response):
@@ -988,12 +1135,17 @@ def _tiktok_comments_playwright(video_url: str, video_id: str, max_comments: int
     )
 
 
-def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int = 100, proxy_url: Optional[str] = None) -> CommentsResponse:
+def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int = 100,
+                             proxy_url: Optional[str] = None,
+                             cookies_file: Optional[str] = None) -> CommentsResponse:
     """Extract comments from a TikTok video.
 
     Strategy:
       1. Try the lightweight direct API (no browser needed)
-      2. Fall back to TikTok-Api (Playwright) if the direct API fails
+      2. Fall back to Playwright browser (intercept API responses)
+
+    TikTok now requires login to show comments on most videos.
+    Provide cookies_file (Netscape format from 'Get cookies.txt LOCALLY') for auth.
     """
     import re
 
@@ -1034,7 +1186,10 @@ def extract_tiktok_comments(url: str, use_proxy: bool = False, max_comments: int
     # Step 3: fall back to Playwright browser (intercept API responses)
     if proxy_url:
         try:
-            return _tiktok_comments_playwright(url, video_id, max_comments, video_title, comment_count, proxy_url)
+            return _tiktok_comments_playwright(
+                url, video_id, max_comments, video_title, comment_count,
+                proxy_url, cookies_file,
+            )
         except Exception as e:
             errors.append(f"Playwright: {e}")
     else:
@@ -1695,13 +1850,8 @@ def select_format_url(formats: list, quality: str = "best") -> Optional[Dict[str
     if combined_pick:
         combined_h = combined_pick.get('height') or 0
         if target is None:
-            # "best" quality: check if video-only offers significantly higher resolution
-            video_only_pick = _pick(video_only, None)
-            if video_only_pick:
-                vo_h = video_only_pick.get('height') or 0
-                if vo_h > combined_h:
-                    # Return video-only for higher quality
-                    return video_only_pick
+            # "best" quality: always prefer combined (video+audio) so the URL
+            # is directly playable. Video-only URLs can't be used without merging.
             return combined_pick
         elif combined_h >= target:
             return combined_pick
@@ -1779,7 +1929,7 @@ def _try_extract_comments(platform: str, url: str, max_comments: int,
     if platform == "youtube":
         return extract_youtube_comments(url, False, max_comments, proxy_url)
     elif platform == "tiktok":
-        return extract_tiktok_comments(url, False, max_comments, proxy_url)
+        return extract_tiktok_comments(url, False, max_comments, proxy_url, cookies_file)
     elif platform == "twitter":
         return extract_twitter_comments(url, False, max_comments, proxy_url, cookies_file)
     elif platform == "instagram":
@@ -1804,6 +1954,7 @@ async def apify_main():
         max_comments = actor_input.get("maxComments", 50)
         video_quality = actor_input.get("videoQuality", "best")
         twitter_cookies_file = actor_input.get("twitterCookiesFile", "twitter_cookies.txt")
+        tiktok_cookies_file = actor_input.get("tiktokCookiesFile", "tiktok_cookies.txt")
 
         if not url:
             Actor.log.error("No URL provided. Please provide a video URL.")
@@ -1880,20 +2031,22 @@ async def apify_main():
                 Actor.log.info(f"Extracting up to {max_comments} comments...")
                 comments_resp = None
 
-                # TikTok and Twitter always need a residential proxy from a datacenter —
-                # skip the pointless no-proxy attempt and go straight to residential.
-                # YouTube/Instagram are tried without a proxy first (saves time when it works).
-                if platform in ("tiktok", "twitter"):
-                    pre_strategies = []
-                else:
-                    pre_strategies = [("no proxy", None)]
+                # Always use Apify residential proxy — no-proxy attempts removed.
+                # Datacenter IPs are blocked or rate-limited by all platforms for comments.
+                pre_strategies: list = []
+
+                # Resolve which cookies file to pass for this platform
+                platform_cookies = {
+                    "twitter": twitter_cookies_file,
+                    "tiktok": tiktok_cookies_file,
+                }.get(platform)
 
                 for strategy_name, strategy_proxy in pre_strategies:
                     try:
                         Actor.log.info(f"Comments: trying {strategy_name}...")
                         comments_resp = await asyncio.to_thread(
-                            _try_extract_comments, platform, url, max_comments, strategy_proxy,
-                            twitter_cookies_file if platform == "twitter" else None
+                            _try_extract_comments, platform, url, max_comments,
+                            strategy_proxy, platform_cookies,
                         )
                         if comments_resp and comments_resp.comments:
                             Actor.log.info(f"Got {len(comments_resp.comments)} comments via {strategy_name}")
@@ -1909,8 +2062,8 @@ async def apify_main():
                         try:
                             Actor.log.info("Comments: trying Apify residential proxy...")
                             comments_resp = await asyncio.to_thread(
-                                _try_extract_comments, platform, url, max_comments, proxy_url,
-                                twitter_cookies_file if platform == "twitter" else None
+                                _try_extract_comments, platform, url, max_comments,
+                                proxy_url, platform_cookies,
                             )
                             if comments_resp and comments_resp.comments:
                                 Actor.log.info(f"Got {len(comments_resp.comments)} comments via residential proxy")
